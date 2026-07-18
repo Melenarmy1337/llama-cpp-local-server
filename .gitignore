@@ -1,0 +1,41 @@
+# Build products and packaged llama.cpp runtime
+/bin/
+*.exe
+*.dll
+*.lib
+*.obj
+*.pdb
+*.ilk
+
+# Local models and downloads
+/models/
+/downloads/
+*.gguf
+*.safetensors
+*.bin
+*.pt
+*.pth
+
+# Runtime data and diagnostics
+/logs/
+/state/
+*.log
+*.pid
+
+# Local tooling and editor state
+/.agents/
+/.codex/
+.vs/
+.vscode/
+*.user
+
+# Credentials and local configuration
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.pfx
+*.p12
+secrets/
+credentials/

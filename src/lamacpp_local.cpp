@@ -1,0 +1,1482 @@
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <windows.h>
+#include <shellapi.h>
+
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cstdlib>
+#include <cctype>
+#include <filesystem>
+#include <fstream>
+#include <iostream>
+#include <map>
+#include <mutex>
+#include <optional>
+#include <sstream>
+#include <stdexcept>
+#include <string>
+#include <thread>
+#include <vector>
+
+#pragma comment(lib, "ws2_32.lib")
+#pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "advapi32.lib")
+
+namespace fs = std::filesystem;
+
+struct Settings {
+    std::string llama_host = "0.0.0.0";
+    int llama_port = 8080;
+    std::string proxy_host = "0.0.0.0";
+    int proxy_port = 11434;
+    std::vector<int> contexts = {262144, 196608, 131072, 98304, 65536, 32768, 16384, 8192};
+    int threads = 8;
+    int threads_batch = 8;
+    int parallel = 1;
+    int fit_target_mib = 512;
+    int batch_size = 2048;
+    int ubatch_size = 512;
+};
+
+struct HttpResponse {
+    int status = 0;
+    std::string raw;
+    std::string headers;
+    std::string body;
+};
+
+static std::string lower(std::string s) {
+    std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return char(std::tolower(c)); });
+    return s;
+}
+
+static std::string trim(const std::string & s) {
+    size_t b = 0;
+    while (b < s.size() && std::isspace(static_cast<unsigned char>(s[b]))) b++;
+    size_t e = s.size();
+    while (e > b && std::isspace(static_cast<unsigned char>(s[e - 1]))) e--;
+    return s.substr(b, e - b);
+}
+
+static int hex_value(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return 10 + c - 'a';
+    if (c >= 'A' && c <= 'F') return 10 + c - 'A';
+    return -1;
+}
+
+static bool parse_hex4(const std::string & s, size_t pos, uint32_t & value) {
+    if (pos + 4 > s.size()) return false;
+    value = 0;
+    for (size_t i = 0; i < 4; ++i) {
+        int v = hex_value(s[pos + i]);
+        if (v < 0) return false;
+        value = (value << 4) | uint32_t(v);
+    }
+    return true;
+}
+
+static void append_utf8(std::string & out, uint32_t cp) {
+    if (cp <= 0x7F) {
+        out += char(cp);
+    } else if (cp <= 0x7FF) {
+        out += char(0xC0 | (cp >> 6));
+        out += char(0x80 | (cp & 0x3F));
+    } else if (cp <= 0xFFFF) {
+        out += char(0xE0 | (cp >> 12));
+        out += char(0x80 | ((cp >> 6) & 0x3F));
+        out += char(0x80 | (cp & 0x3F));
+    } else {
+        out += char(0xF0 | (cp >> 18));
+        out += char(0x80 | ((cp >> 12) & 0x3F));
+        out += char(0x80 | ((cp >> 6) & 0x3F));
+        out += char(0x80 | (cp & 0x3F));
+    }
+}
+
+static std::string decode_chunked(const std::string & body) {
+    std::string out;
+    size_t pos = 0;
+    for (;;) {
+        size_t line_end = body.find("\r\n", pos);
+        if (line_end == std::string::npos) return body;
+        std::string size_text = body.substr(pos, line_end - pos);
+        size_t semi = size_text.find(';');
+        if (semi != std::string::npos) size_text.resize(semi);
+        size_text = trim(size_text);
+        size_t chunk_size = 0;
+        try {
+            chunk_size = std::stoull(size_text, nullptr, 16);
+        } catch (...) {
+            return body;
+        }
+        pos = line_end + 2;
+        if (chunk_size == 0) break;
+        if (pos + chunk_size > body.size()) return body;
+        out.append(body, pos, chunk_size);
+        pos += chunk_size;
+        if (pos + 2 <= body.size() && body.substr(pos, 2) == "\r\n") pos += 2;
+    }
+    return out;
+}
+
+static std::string quote_arg(const std::string & s) {
+    std::string out = "\"";
+    for (char c : s) {
+        if (c == '"') out += "\\\"";
+        else out += c;
+    }
+    out += "\"";
+    return out;
+}
+
+static fs::path exe_path() {
+    std::string buffer(MAX_PATH, '\0');
+    DWORD len = GetModuleFileNameA(nullptr, buffer.data(), DWORD(buffer.size()));
+    if (len == 0) throw std::runtime_error("GetModuleFileNameA failed");
+    while (len == buffer.size()) {
+        buffer.resize(buffer.size() * 2, '\0');
+        len = GetModuleFileNameA(nullptr, buffer.data(), DWORD(buffer.size()));
+        if (len == 0) throw std::runtime_error("GetModuleFileNameA failed");
+    }
+    buffer.resize(len);
+    return fs::path(buffer);
+}
+
+static fs::path root_dir() {
+    fs::path parent = exe_path().parent_path();
+    if (lower(parent.filename().string()) == "bin") return parent.parent_path();
+    return fs::current_path();
+}
+
+static fs::path path_in_root(const std::string & rel) {
+    return root_dir() / fs::path(rel);
+}
+
+static std::string read_file(const fs::path & p) {
+    std::ifstream in(p, std::ios::binary);
+    if (!in) return {};
+    std::ostringstream ss;
+    ss << in.rdbuf();
+    return ss.str();
+}
+
+static void write_file(const fs::path & p, const std::string & content) {
+    fs::create_directories(p.parent_path());
+    std::ofstream out(p, std::ios::binary | std::ios::trunc);
+    if (!out) throw std::runtime_error("cannot write " + p.string());
+    out << content;
+}
+
+static std::optional<int> read_pid(const fs::path & p) {
+    std::string s = trim(read_file(p));
+    if (s.empty()) return std::nullopt;
+    try { return std::stoi(s); } catch (...) { return std::nullopt; }
+}
+
+static bool process_alive(int pid) {
+    HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, DWORD(pid));
+    if (!h) return false;
+    DWORD code = 0;
+    bool alive = GetExitCodeProcess(h, &code) && code == STILL_ACTIVE;
+    CloseHandle(h);
+    return alive;
+}
+
+static void stop_pid_file(const fs::path & p, const std::string & name) {
+    auto pid = read_pid(p);
+    if (!pid || !process_alive(*pid)) {
+        std::cout << name << " is not running\n";
+        std::error_code ec;
+        fs::remove(p, ec);
+        return;
+    }
+    HANDLE h = OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, FALSE, DWORD(*pid));
+    if (!h) throw std::runtime_error("cannot open process " + std::to_string(*pid));
+    TerminateProcess(h, 0);
+    WaitForSingleObject(h, 5000);
+    CloseHandle(h);
+    std::error_code ec;
+    fs::remove(p, ec);
+    std::cout << "stopped " << name << " pid " << *pid << "\n";
+}
+
+static std::string json_escape(const std::string & s) {
+    std::string out;
+    out.reserve(s.size() + 16);
+    for (unsigned char c : s) {
+        switch (c) {
+            case '\\': out += "\\\\"; break;
+            case '"': out += "\\\""; break;
+            case '\n': out += "\\n"; break;
+            case '\r': out += "\\r"; break;
+            case '\t': out += "\\t"; break;
+            default:
+                if (c < 0x20) {
+                    char buf[8];
+                    std::snprintf(buf, sizeof(buf), "\\u%04x", c);
+                    out += buf;
+                } else {
+                    out += char(c);
+                }
+        }
+    }
+    return out;
+}
+
+static std::optional<std::string> parse_json_string_at(const std::string & s, size_t quote_pos, size_t * end_pos = nullptr) {
+    if (quote_pos >= s.size() || s[quote_pos] != '"') return std::nullopt;
+    std::string out;
+    for (size_t i = quote_pos + 1; i < s.size(); ++i) {
+        char c = s[i];
+        if (c == '"') {
+            if (end_pos) *end_pos = i + 1;
+            return out;
+        }
+        if (c == '\\' && i + 1 < s.size()) {
+            char e = s[++i];
+            switch (e) {
+                case '"': out += '"'; break;
+                case '\\': out += '\\'; break;
+                case '/': out += '/'; break;
+                case 'b': out += '\b'; break;
+                case 'f': out += '\f'; break;
+                case 'n': out += '\n'; break;
+                case 'r': out += '\r'; break;
+                case 't': out += '\t'; break;
+                case 'u': {
+                    uint32_t cp = 0;
+                    if (!parse_hex4(s, i + 1, cp)) {
+                        out += '?';
+                        break;
+                    }
+                    i += 4;
+                    if (cp >= 0xD800 && cp <= 0xDBFF && i + 6 < s.size() && s[i + 1] == '\\' && s[i + 2] == 'u') {
+                        uint32_t low = 0;
+                        if (parse_hex4(s, i + 3, low) && low >= 0xDC00 && low <= 0xDFFF) {
+                            cp = 0x10000 + (((cp - 0xD800) << 10) | (low - 0xDC00));
+                            i += 6;
+                        }
+                    }
+                    append_utf8(out, cp);
+                    break;
+                }
+                default: out += e; break;
+            }
+        } else {
+            out += c;
+        }
+    }
+    return std::nullopt;
+}
+
+static size_t find_key_colon(const std::string & json, const std::string & key) {
+    std::string needle = "\"" + key + "\"";
+    size_t pos = json.find(needle);
+    if (pos == std::string::npos) return pos;
+    pos = json.find(':', pos + needle.size());
+    return pos;
+}
+
+static std::optional<std::string> json_string_value(const std::string & json, const std::string & key) {
+    size_t colon = find_key_colon(json, key);
+    if (colon == std::string::npos) return std::nullopt;
+    size_t q = json.find('"', colon + 1);
+    if (q == std::string::npos) return std::nullopt;
+    return parse_json_string_at(json, q);
+}
+
+static std::optional<int> json_int_value(const std::string & json, const std::string & key) {
+    size_t colon = find_key_colon(json, key);
+    if (colon == std::string::npos) return std::nullopt;
+    size_t p = colon + 1;
+    while (p < json.size() && std::isspace(static_cast<unsigned char>(json[p]))) p++;
+    size_t e = p;
+    if (e < json.size() && json[e] == '-') e++;
+    while (e < json.size() && std::isdigit(static_cast<unsigned char>(json[e]))) e++;
+    if (e == p) return std::nullopt;
+    try { return std::stoi(json.substr(p, e - p)); } catch (...) { return std::nullopt; }
+}
+
+static bool json_bool_value(const std::string & json, const std::string & key, bool fallback) {
+    size_t colon = find_key_colon(json, key);
+    if (colon == std::string::npos) return fallback;
+    std::string tail = lower(trim(json.substr(colon + 1, 8)));
+    if (tail.rfind("true", 0) == 0) return true;
+    if (tail.rfind("false", 0) == 0) return false;
+    return fallback;
+}
+
+static std::optional<std::string> json_value_slice(const std::string & json, const std::string & key) {
+    size_t colon = find_key_colon(json, key);
+    if (colon == std::string::npos) return std::nullopt;
+    size_t p = colon + 1;
+    while (p < json.size() && std::isspace(static_cast<unsigned char>(json[p]))) p++;
+    if (p >= json.size()) return std::nullopt;
+    char open = json[p];
+    char close = 0;
+    if (open == '[') close = ']';
+    else if (open == '{') close = '}';
+    else if (open == '"') {
+        size_t end = 0;
+        if (!parse_json_string_at(json, p, &end)) return std::nullopt;
+        return json.substr(p, end - p);
+    } else {
+        size_t e = p;
+        while (e < json.size() && json[e] != ',' && json[e] != '}' && json[e] != '\r' && json[e] != '\n') e++;
+        return trim(json.substr(p, e - p));
+    }
+    int depth = 0;
+    bool in_str = false;
+    bool esc = false;
+    for (size_t i = p; i < json.size(); ++i) {
+        char c = json[i];
+        if (in_str) {
+            if (esc) esc = false;
+            else if (c == '\\') esc = true;
+            else if (c == '"') in_str = false;
+            continue;
+        }
+        if (c == '"') in_str = true;
+        else if (c == open) depth++;
+        else if (c == close) {
+            depth--;
+            if (depth == 0) return json.substr(p, i - p + 1);
+        }
+    }
+    return std::nullopt;
+}
+
+static std::string last_content_value(const std::string & json) {
+    std::string value;
+    std::string needle = "\"content\"";
+    size_t pos = 0;
+    while ((pos = json.find(needle, pos)) != std::string::npos) {
+        size_t colon = json.find(':', pos + needle.size());
+        if (colon == std::string::npos) break;
+        size_t q = json.find('"', colon + 1);
+        if (q == std::string::npos) break;
+        if (auto s = parse_json_string_at(json, q)) value = *s;
+        pos = q + 1;
+    }
+    return value;
+}
+
+class WinsockInit {
+public:
+    WinsockInit() {
+        WSADATA wsa{};
+        if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) throw std::runtime_error("WSAStartup failed");
+    }
+    ~WinsockInit() { WSACleanup(); }
+};
+
+static std::atomic<DWORD> g_child_pid{0};
+static std::atomic<bool> g_stop_requested{false};
+static std::atomic<unsigned long long> g_request_id{1};
+static std::mutex g_log_mutex;
+
+static BOOL WINAPI console_handler(DWORD type) {
+    if (type == CTRL_C_EVENT || type == CTRL_BREAK_EVENT || type == CTRL_CLOSE_EVENT || type == CTRL_SHUTDOWN_EVENT) {
+        g_stop_requested = true;
+        DWORD pid = g_child_pid.load();
+        if (pid) {
+            HANDLE h = OpenProcess(PROCESS_TERMINATE, FALSE, pid);
+            if (h) {
+                TerminateProcess(h, 0);
+                CloseHandle(h);
+            }
+        }
+        return TRUE;
+    }
+    return FALSE;
+}
+
+static void send_all(SOCKET s, const std::string & data) {
+    const char * p = data.data();
+    size_t left = data.size();
+    while (left > 0) {
+        int n = send(s, p, int(std::min<size_t>(left, 1 << 20)), 0);
+        if (n <= 0) throw std::runtime_error("socket send failed");
+        p += n;
+        left -= size_t(n);
+    }
+}
+
+static std::string log_preview(std::string s, size_t limit = 300) {
+    for (char & c : s) {
+        if (c == '\r' || c == '\n' || c == '\t') c = ' ';
+    }
+    if (s.size() > limit) s = s.substr(0, limit) + "...";
+    return s;
+}
+
+static std::string log_timestamp() {
+    SYSTEMTIME st{};
+    GetSystemTime(&st);
+    char buf[40];
+    std::snprintf(buf, sizeof(buf), "%04u-%02u-%02uT%02u:%02u:%02u.%03uZ",
+                  unsigned(st.wYear), unsigned(st.wMonth), unsigned(st.wDay),
+                  unsigned(st.wHour), unsigned(st.wMinute), unsigned(st.wSecond),
+                  unsigned(st.wMilliseconds));
+    return buf;
+}
+
+static void append_log_line(const fs::path & file, const std::string & line) {
+    std::lock_guard<std::mutex> lock(g_log_mutex);
+    std::error_code ec;
+    fs::create_directories(file.parent_path(), ec);
+    std::ofstream out(file, std::ios::binary | std::ios::app);
+    out << log_timestamp() << " pid=" << GetCurrentProcessId()
+        << " tid=" << GetCurrentThreadId() << " " << line << "\n";
+}
+
+static void proxy_log(const std::string & line) {
+    append_log_line(path_in_root("logs/proxy-detailed.log"), line);
+}
+
+static void proxy_json_log(const std::string & json_object) {
+    append_log_line(path_in_root("logs/proxy-requests.jsonl"), json_object);
+}
+
+static HttpResponse http_request(const std::string & host, int port, const std::string & method, const std::string & target,
+                                 const std::string & body = {}, const std::map<std::string, std::string> & headers = {}) {
+    addrinfo hints{};
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    addrinfo * result = nullptr;
+    std::string port_s = std::to_string(port);
+    if (getaddrinfo(host.c_str(), port_s.c_str(), &hints, &result) != 0 || !result) {
+        throw std::runtime_error("cannot resolve " + host);
+    }
+    SOCKET sock = socket(result->ai_family, result->ai_socktype, result->ai_protocol);
+    if (sock == INVALID_SOCKET) {
+        freeaddrinfo(result);
+        throw std::runtime_error("cannot create socket");
+    }
+    DWORD timeout_ms = 900000;
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char *>(&timeout_ms), sizeof(timeout_ms));
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char *>(&timeout_ms), sizeof(timeout_ms));
+    if (connect(sock, result->ai_addr, int(result->ai_addrlen)) != 0) {
+        freeaddrinfo(result);
+        closesocket(sock);
+        throw std::runtime_error("cannot connect to " + host + ":" + port_s);
+    }
+    freeaddrinfo(result);
+
+    std::ostringstream req;
+    req << method << " " << target << " HTTP/1.1\r\n";
+    req << "Host: " << host << ":" << port << "\r\n";
+    req << "Connection: close\r\n";
+    for (const auto & [k, v] : headers) req << k << ": " << v << "\r\n";
+    if (!body.empty()) req << "Content-Length: " << body.size() << "\r\n";
+    req << "\r\n";
+    req << body;
+    send_all(sock, req.str());
+
+    std::string raw;
+    char buf[32768];
+    for (;;) {
+        int n = recv(sock, buf, sizeof(buf), 0);
+        if (n <= 0) break;
+        raw.append(buf, buf + n);
+    }
+    closesocket(sock);
+
+    HttpResponse r;
+    r.raw = raw;
+    size_t h = raw.find("\r\n\r\n");
+    if (h != std::string::npos) {
+        r.headers = raw.substr(0, h + 4);
+        r.body = raw.substr(h + 4);
+    } else {
+        r.body = raw;
+    }
+    if (lower(r.headers).find("transfer-encoding: chunked") != std::string::npos) {
+        r.body = decode_chunked(r.body);
+    }
+    size_t sp = raw.find(' ');
+    if (sp != std::string::npos && sp + 4 <= raw.size()) {
+        try { r.status = std::stoi(raw.substr(sp + 1, 3)); } catch (...) {}
+    }
+    return r;
+}
+
+static std::string http_reply(int status, const std::string & content_type, const std::string & body) {
+    std::string reason = status == 200 ? "OK" : status == 404 ? "Not Found" : "Error";
+    std::ostringstream out;
+    out << "HTTP/1.1 " << status << " " << reason << "\r\n";
+    out << "Content-Type: " << content_type << "\r\n";
+    out << "Content-Length: " << body.size() << "\r\n";
+    out << "Connection: close\r\n\r\n";
+    out << body;
+    return out.str();
+}
+
+static std::vector<fs::path> gguf_files() {
+    std::vector<fs::path> out;
+    fs::path dir = path_in_root("models");
+    if (!fs::exists(dir)) return out;
+    for (const auto & e : fs::recursive_directory_iterator(dir)) {
+        if (e.is_regular_file() && lower(e.path().extension().string()) == ".gguf") out.push_back(e.path());
+    }
+    std::sort(out.begin(), out.end());
+    return out;
+}
+
+static std::string default_model() {
+    std::string state = trim(read_file(path_in_root("state/default-model.txt")));
+    if (!state.empty()) return state;
+    auto files = gguf_files();
+    if (!files.empty()) return files.front().stem().string();
+    return {};
+}
+
+static void write_default_model(const std::string & model) {
+    write_file(path_in_root("state/default-model.txt"), model + "\n");
+}
+
+static std::string utc_timestamp() {
+    SYSTEMTIME st{};
+    GetSystemTime(&st);
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "%04u-%02u-%02uT%02u:%02u:%02uZ",
+                  unsigned(st.wYear), unsigned(st.wMonth), unsigned(st.wDay),
+                  unsigned(st.wHour), unsigned(st.wMinute), unsigned(st.wSecond));
+    return buf;
+}
+
+static std::string preferred_device() {
+    if (fs::exists(path_in_root("bin/ggml-cuda.dll"))) return "CUDA0";
+    if (fs::exists(path_in_root("bin/ggml-vulkan.dll"))) return "Vulkan0";
+    return "";
+}
+
+static std::string backend_name() {
+    if (fs::exists(path_in_root("bin/ggml-cuda.dll"))) return "CUDA";
+    if (fs::exists(path_in_root("bin/ggml-vulkan.dll"))) return "Vulkan";
+    return "CPU";
+}
+
+static std::string ollama_tags_json() {
+    auto files = gguf_files();
+    std::ostringstream out;
+    out << "{\"models\":[";
+    for (size_t i = 0; i < files.size(); ++i) {
+        if (i) out << ",";
+        std::string id = files[i].stem().string();
+        uintmax_t size = 0;
+        std::error_code ec;
+        size = fs::file_size(files[i], ec);
+        out << "{\"name\":\"" << json_escape(id) << "\",";
+        out << "\"model\":\"" << json_escape(id) << "\",";
+        out << "\"modified_at\":\"" << utc_timestamp() << "\",";
+        out << "\"size\":" << size << ",";
+        out << "\"digest\":\"\",";
+        out << "\"details\":{\"format\":\"gguf\",\"family\":\"unknown\",\"families\":[],\"parameter_size\":\"\",\"quantization_level\":\"\"}}";
+    }
+    out << "]}";
+    return out.str();
+}
+
+static void write_preset(int ctx, const Settings & s) {
+    std::ostringstream out;
+    out << "version = 1\n\n";
+    out << "[*]\n";
+    out << "c = " << ctx << "\n";
+    out << "n-gpu-layers = auto\n";
+    out << "fit = on\n";
+    out << "fit-target = " << s.fit_target_mib << "\n";
+    out << "flash-attn = auto\n";
+    out << "kv-offload = true\n";
+    out << "cache-type-k = q8_0\n";
+    out << "cache-type-v = q8_0\n";
+    out << "threads = " << s.threads << "\n";
+    out << "threads-batch = " << s.threads_batch << "\n";
+    out << "parallel = " << s.parallel << "\n";
+    out << "jinja = true\n";
+    out << "batch-size = " << s.batch_size << "\n";
+    out << "ubatch-size = " << s.ubatch_size << "\n";
+    write_file(path_in_root("config/models.preset.ini"), out.str());
+}
+
+static DWORD start_process(const std::string & cmdline, const fs::path & workdir, const fs::path & out_log, const fs::path & err_log) {
+    fs::create_directories(out_log.parent_path());
+    SECURITY_ATTRIBUTES sa{};
+    sa.nLength = sizeof(sa);
+    sa.bInheritHandle = TRUE;
+    HANDLE out = CreateFileA(out_log.string().c_str(), FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, &sa, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    HANDLE err = CreateFileA(err_log.string().c_str(), FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, &sa, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (out == INVALID_HANDLE_VALUE || err == INVALID_HANDLE_VALUE) throw std::runtime_error("cannot open log files");
+    HANDLE stdin_read = nullptr;
+    HANDLE stdin_write = nullptr;
+    if (!CreatePipe(&stdin_read, &stdin_write, &sa, 0)) {
+        CloseHandle(out);
+        CloseHandle(err);
+        throw std::runtime_error("cannot create stdin pipe");
+    }
+    SetFilePointer(out, 0, nullptr, FILE_END);
+    SetFilePointer(err, 0, nullptr, FILE_END);
+
+    STARTUPINFOA si{};
+    PROCESS_INFORMATION pi{};
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdInput = stdin_read;
+    si.hStdOutput = out;
+    si.hStdError = err;
+
+    std::string mutable_cmd = cmdline;
+    DWORD flags = CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS | CREATE_BREAKAWAY_FROM_JOB;
+    BOOL ok = CreateProcessA(nullptr, mutable_cmd.data(), nullptr, nullptr, TRUE, flags, nullptr, workdir.string().c_str(), &si, &pi);
+    if (!ok) {
+        flags = CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS;
+        mutable_cmd = cmdline;
+        ok = CreateProcessA(nullptr, mutable_cmd.data(), nullptr, nullptr, TRUE, flags, nullptr, workdir.string().c_str(), &si, &pi);
+    }
+    CloseHandle(stdin_read);
+    CloseHandle(stdin_write);
+    CloseHandle(out);
+    CloseHandle(err);
+    if (!ok) throw std::runtime_error("CreateProcess failed: " + cmdline);
+    DWORD pid = pi.dwProcessId;
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    return pid;
+}
+
+static PROCESS_INFORMATION start_process_console(const std::string & cmdline, const fs::path & workdir) {
+    STARTUPINFOA si{};
+    PROCESS_INFORMATION pi{};
+    si.cb = sizeof(si);
+    std::string mutable_cmd = cmdline;
+    BOOL ok = CreateProcessA(nullptr, mutable_cmd.data(), nullptr, nullptr, TRUE, 0, nullptr, workdir.string().c_str(), &si, &pi);
+    if (!ok) throw std::runtime_error("CreateProcess failed: " + cmdline);
+    return pi;
+}
+
+struct FirewallRule {
+    const char * name;
+    int port;
+};
+
+static const FirewallRule FIREWALL_RULES[] = {
+    {"llamacpp server 8080 private subnet", 8080},
+    {"llamacpp ollama proxy 11434 private subnet", 11434},
+};
+
+static bool is_process_elevated() {
+    HANDLE token = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) return false;
+    TOKEN_ELEVATION elevation{};
+    DWORD size = sizeof(elevation);
+    BOOL ok = GetTokenInformation(token, TokenElevation, &elevation, sizeof(elevation), &size);
+    CloseHandle(token);
+    return ok && elevation.TokenIsElevated;
+}
+
+static int shell_status_quiet(const std::string & cmd) {
+    std::string quiet = cmd + " >nul 2>nul";
+    return std::system(quiet.c_str());
+}
+
+static bool firewall_rule_exists(const FirewallRule & rule) {
+    std::string cmd = "netsh advfirewall firewall show rule name=\"" + std::string(rule.name) + "\"";
+    return shell_status_quiet(cmd) == 0;
+}
+
+static int add_firewall_rule(const FirewallRule & rule) {
+    if (firewall_rule_exists(rule)) {
+        std::cout << "present: " << rule.name << "\n";
+        return 0;
+    }
+    std::ostringstream cmd;
+    cmd << "netsh advfirewall firewall add rule name=\"" << rule.name
+        << "\" dir=in action=allow protocol=TCP localport=" << rule.port
+        << " profile=private remoteip=localsubnet";
+    int rc = std::system(cmd.str().c_str());
+    if (rc != 0 || !firewall_rule_exists(rule)) {
+        std::cerr << "failed: " << rule.name << "\n";
+        return 1;
+    }
+    std::cout << "added: " << rule.name << "\n";
+    return 0;
+}
+
+static int request_firewall_elevation() {
+    std::string args = "firewall --elevated";
+    HINSTANCE result = ShellExecuteA(nullptr, "runas", exe_path().string().c_str(), args.c_str(), root_dir().string().c_str(), SW_SHOWNORMAL);
+    INT_PTR code = reinterpret_cast<INT_PTR>(result);
+    if (code <= 32) throw std::runtime_error("UAC elevation failed for firewall setup, ShellExecute code " + std::to_string(code));
+    std::cout << "UAC elevation requested for firewall setup. Confirm the Windows prompt.\n";
+    return 0;
+}
+
+static bool wait_health(int seconds) {
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(seconds);
+    while (std::chrono::steady_clock::now() < deadline) {
+        try {
+            auto r = http_request("127.0.0.1", 8080, "GET", "/health");
+            if (r.status >= 200 && r.status < 500) return true;
+        } catch (...) {}
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+    }
+    return false;
+}
+
+static bool preload_model(const std::string & model) {
+    if (model.empty()) return true;
+    std::string body = "{\"model\":\"" + json_escape(model) + "\",\"messages\":[{\"role\":\"user\",\"content\":\"ping\"}],\"max_tokens\":1,\"stream\":false}";
+    try {
+        auto r = http_request("127.0.0.1", 8080, "POST", "/v1/chat/completions", body, {{"Content-Type", "application/json"}});
+        return r.status >= 200 && r.status < 300;
+    } catch (const std::exception & e) {
+        std::cerr << "preload failed: " << e.what() << "\n";
+        return false;
+    }
+}
+
+static std::string build_llama_server_command(int ctx, const Settings & s) {
+    (void)ctx;
+    fs::path llama = path_in_root("bin/llama-server.exe");
+    std::ostringstream cmd;
+    cmd << quote_arg(llama.string())
+        << " --host " << s.llama_host
+        << " --port " << s.llama_port
+        << " --models-dir " << quote_arg(path_in_root("models").string())
+        << " --models-preset " << quote_arg(path_in_root("config/models.preset.ini").string())
+        << " --prio 2"
+        << " --poll 75"
+        << " --no-mmap";
+    std::string dev = preferred_device();
+    if (!dev.empty()) cmd << " --device " << dev;
+    return cmd.str();
+}
+
+static std::string openai_content_from_response(const std::string & body) {
+    size_t message = body.find("\"message\"");
+    size_t pos = message == std::string::npos ? 0 : message;
+    size_t content_key = body.find("\"content\"", pos);
+    if (content_key == std::string::npos) content_key = body.find("\"text\"");
+    if (content_key == std::string::npos) return {};
+    size_t colon = body.find(':', content_key);
+    if (colon == std::string::npos) return {};
+    size_t q = body.find('"', colon + 1);
+    if (q == std::string::npos) return {};
+    std::string content = parse_json_string_at(body, q).value_or("");
+    if (!content.empty()) return content;
+    size_t reasoning_key = body.find("\"reasoning_content\"", pos);
+    if (reasoning_key == std::string::npos) return content;
+    colon = body.find(':', reasoning_key);
+    if (colon == std::string::npos) return content;
+    q = body.find('"', colon + 1);
+    if (q == std::string::npos) return content;
+    return parse_json_string_at(body, q).value_or(content);
+}
+
+static int openai_token_count(const std::string & body, const std::string & key) {
+    return json_int_value(body, key).value_or(0);
+}
+
+static std::string openai_finish_reason(const std::string & body) {
+    return json_string_value(body, "finish_reason").value_or("");
+}
+
+struct ResolvedTokenLimit {
+    int value = 8192;
+    std::string source = "proxy_default_8192";
+};
+
+static ResolvedTokenLimit normalize_token_limit(std::optional<int> raw, const std::string & source) {
+    if (!raw) return {};
+    if (*raw <= 0) return {8192, source + "_nonpositive_fallback_8192"};
+    return {*raw, source};
+}
+
+static ResolvedTokenLimit resolve_ollama_max_tokens(const std::string & request_body) {
+    if (auto options = json_value_slice(request_body, "options")) {
+        if (auto n = json_int_value(*options, "num_predict")) return normalize_token_limit(n, "options.num_predict");
+        if (auto n = json_int_value(*options, "max_tokens")) return normalize_token_limit(n, "options.max_tokens");
+    }
+    if (auto n = json_int_value(request_body, "num_predict")) return normalize_token_limit(n, "num_predict");
+    if (auto n = json_int_value(request_body, "max_tokens")) return normalize_token_limit(n, "max_tokens");
+    return {};
+}
+
+static std::string make_openai_body_from_ollama(const std::string & request_body, ResolvedTokenLimit * resolved_limit = nullptr) {
+    std::string model = json_string_value(request_body, "model").value_or(default_model());
+    if (model.empty()) model = "default";
+    ResolvedTokenLimit limit = resolve_ollama_max_tokens(request_body);
+    if (resolved_limit) *resolved_limit = limit;
+    std::string messages;
+    if (auto m = json_value_slice(request_body, "messages")) {
+        messages = *m;
+    } else {
+        std::string prompt = json_string_value(request_body, "prompt").value_or(last_content_value(request_body));
+        messages = "[{\"role\":\"user\",\"content\":\"" + json_escape(prompt) + "\"}]";
+    }
+    std::ostringstream out;
+    out << "{\"model\":\"" << json_escape(model) << "\",";
+    out << "\"messages\":" << messages << ",";
+    out << "\"max_tokens\":" << limit.value << ",";
+    out << "\"stream\":false";
+    if (auto temp = json_value_slice(request_body, "temperature")) out << ",\"temperature\":" << *temp;
+    if (auto top_p = json_value_slice(request_body, "top_p")) out << ",\"top_p\":" << *top_p;
+    if (auto stop = json_value_slice(request_body, "stop")) out << ",\"stop\":" << *stop;
+    out << "}";
+    return out.str();
+}
+
+struct ParsedRequest {
+    std::string method;
+    std::string target;
+    std::string path;
+    std::map<std::string, std::string> headers;
+    std::string body;
+};
+
+static ParsedRequest read_http_request(SOCKET client) {
+    std::string data;
+    char buf[8192];
+    size_t header_end = std::string::npos;
+    while ((header_end = data.find("\r\n\r\n")) == std::string::npos) {
+        int n = recv(client, buf, sizeof(buf), 0);
+        if (n <= 0) throw std::runtime_error("client disconnected");
+        data.append(buf, buf + n);
+        if (data.size() > 1024 * 1024) throw std::runtime_error("request headers too large");
+    }
+    std::string header_block = data.substr(0, header_end);
+    std::istringstream hs(header_block);
+    ParsedRequest req;
+    std::string version;
+    hs >> req.method >> req.target >> version;
+    std::string line;
+    std::getline(hs, line);
+    while (std::getline(hs, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        size_t c = line.find(':');
+        if (c == std::string::npos) continue;
+        req.headers[lower(trim(line.substr(0, c)))] = trim(line.substr(c + 1));
+    }
+    req.path = req.target.substr(0, req.target.find('?'));
+    size_t content_length = 0;
+    if (auto it = req.headers.find("content-length"); it != req.headers.end()) {
+        content_length = size_t(std::stoull(it->second));
+    }
+    req.body = data.substr(header_end + 4);
+    while (req.body.size() < content_length) {
+        int n = recv(client, buf, sizeof(buf), 0);
+        if (n <= 0) throw std::runtime_error("client disconnected while reading body");
+        req.body.append(buf, buf + n);
+    }
+    if (req.body.size() > content_length) req.body.resize(content_length);
+    return req;
+}
+
+static std::string build_forward_request(const ParsedRequest & req) {
+    std::ostringstream out;
+    out << req.method << " " << req.target << " HTTP/1.1\r\n";
+    out << "Host: 127.0.0.1:8080\r\n";
+    out << "Connection: close\r\n";
+    for (const auto & [k, v] : req.headers) {
+        if (k == "host" || k == "connection" || k == "content-length") continue;
+        out << k << ": " << v << "\r\n";
+    }
+    if (!req.body.empty()) out << "Content-Length: " << req.body.size() << "\r\n";
+    out << "\r\n" << req.body;
+    return out.str();
+}
+
+static std::string forward_raw_to_llama(const ParsedRequest & req) {
+    addrinfo hints{};
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    addrinfo * result = nullptr;
+    if (getaddrinfo("127.0.0.1", "8080", &hints, &result) != 0 || !result) throw std::runtime_error("cannot resolve llama-server");
+    SOCKET s = socket(result->ai_family, result->ai_socktype, result->ai_protocol);
+    if (s == INVALID_SOCKET) {
+        freeaddrinfo(result);
+        throw std::runtime_error("cannot create upstream socket");
+    }
+    if (connect(s, result->ai_addr, int(result->ai_addrlen)) != 0) {
+        freeaddrinfo(result);
+        closesocket(s);
+        throw std::runtime_error("cannot connect to llama-server");
+    }
+    freeaddrinfo(result);
+    send_all(s, build_forward_request(req));
+    std::string raw;
+    char buf[32768];
+    for (;;) {
+        int n = recv(s, buf, sizeof(buf), 0);
+        if (n <= 0) break;
+        raw.append(buf, buf + n);
+    }
+    closesocket(s);
+    return raw;
+}
+
+static int raw_http_status(const std::string & raw) {
+    size_t sp = raw.find(' ');
+    if (sp == std::string::npos || sp + 4 > raw.size()) return 0;
+    try { return std::stoi(raw.substr(sp + 1, 3)); } catch (...) { return 0; }
+}
+
+static std::string raw_http_body(const std::string & raw) {
+    size_t h = raw.find("\r\n\r\n");
+    if (h == std::string::npos) return {};
+    std::string body = raw.substr(h + 4);
+    std::string headers = lower(raw.substr(0, h + 4));
+    if (headers.find("transfer-encoding: chunked") != std::string::npos) {
+        body = decode_chunked(body);
+    }
+    return body;
+}
+
+static long long elapsed_ms(std::chrono::steady_clock::time_point start) {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
+}
+
+static std::string handle_proxy_request(const ParsedRequest & req, unsigned long long request_id) {
+    if (req.path.rfind("/v1/", 0) == 0) {
+        auto start = std::chrono::steady_clock::now();
+        std::string raw = forward_raw_to_llama(req);
+        int status = raw_http_status(raw);
+        std::string body = raw_http_body(raw);
+        int prompt_tokens = openai_token_count(body, "prompt_tokens");
+        int completion_tokens = openai_token_count(body, "completion_tokens");
+        std::string finish = openai_finish_reason(body);
+        long long ms = elapsed_ms(start);
+        proxy_log("id=" + std::to_string(request_id) + " forward_v1 status=" + std::to_string(status) +
+                  " path=" + req.path + " ms=" + std::to_string(ms) +
+                  " request_bytes=" + std::to_string(req.body.size()) +
+                  " response_bytes=" + std::to_string(body.size()) +
+                  " prompt_tokens=" + std::to_string(prompt_tokens) +
+                  " completion_tokens=" + std::to_string(completion_tokens) +
+                  " finish_reason=" + finish);
+        proxy_json_log("{\"id\":" + std::to_string(request_id) +
+                       ",\"event\":\"forward_v1\",\"path\":\"" + json_escape(req.path) +
+                       "\",\"status\":" + std::to_string(status) +
+                       ",\"ms\":" + std::to_string(ms) +
+                       ",\"request_bytes\":" + std::to_string(req.body.size()) +
+                       ",\"response_bytes\":" + std::to_string(body.size()) +
+                       ",\"prompt_tokens\":" + std::to_string(prompt_tokens) +
+                       ",\"completion_tokens\":" + std::to_string(completion_tokens) +
+                       ",\"finish_reason\":\"" + json_escape(finish) + "\"}");
+        return raw;
+    }
+    if (req.path == "/api/version" && req.method == "GET") {
+        proxy_log("id=" + std::to_string(request_id) + " api_version status=200");
+        return http_reply(200, "application/json; charset=utf-8", "{\"version\":\"llama.cpp-cpp-proxy\"}");
+    }
+    if (req.path == "/api/tags" && req.method == "GET") {
+        proxy_log("id=" + std::to_string(request_id) + " api_tags status=200");
+        return http_reply(200, "application/json; charset=utf-8", ollama_tags_json());
+    }
+    if (req.path == "/api/ps" && req.method == "GET") {
+        proxy_log("id=" + std::to_string(request_id) + " api_ps status=200");
+        return http_reply(200, "application/json; charset=utf-8", ollama_tags_json());
+    }
+    if (req.path == "/api/show" && req.method == "POST") {
+        std::string model = json_string_value(req.body, "model").value_or(default_model());
+        std::string body = "{\"license\":\"\",\"modelfile\":\"\",\"parameters\":\"\",\"template\":\"\",\"details\":{\"format\":\"gguf\",\"family\":\"unknown\",\"families\":[],\"parameter_size\":\"\",\"quantization_level\":\"\"},\"model_info\":{\"name\":\"" + json_escape(model) + "\"}}";
+        proxy_log("id=" + std::to_string(request_id) + " api_show status=200 model=" + model);
+        return http_reply(200, "application/json; charset=utf-8", body);
+    }
+    if ((req.path == "/api/chat" || req.path == "/api/generate") && req.method == "POST") {
+        auto start = std::chrono::steady_clock::now();
+        std::string model = json_string_value(req.body, "model").value_or(default_model());
+        if (model.empty()) model = "default";
+        ResolvedTokenLimit limit;
+        std::string openai_body = make_openai_body_from_ollama(req.body, &limit);
+        bool requested_stream = json_bool_value(req.body, "stream", true);
+        proxy_log("id=" + std::to_string(request_id) + " ollama_in path=" + req.path +
+                  " model=" + model +
+                  " stream=" + std::string(requested_stream ? "true" : "false") +
+                  " max_tokens=" + std::to_string(limit.value) +
+                  " max_tokens_source=" + limit.source +
+                  " request_bytes=" + std::to_string(req.body.size()) +
+                  " openai_bytes=" + std::to_string(openai_body.size()) +
+                  " preview=\"" + json_escape(log_preview(req.body)) + "\"");
+        auto upstream = http_request("127.0.0.1", 8080, "POST", "/v1/chat/completions", openai_body, {{"Content-Type", "application/json"}});
+        if (upstream.status < 200 || upstream.status >= 300) {
+            proxy_log("id=" + std::to_string(request_id) + " ollama_upstream_error status=" + std::to_string(upstream.status) +
+                      " ms=" + std::to_string(elapsed_ms(start)) +
+                      " body=\"" + json_escape(log_preview(upstream.body)) + "\"");
+            return http_reply(500, "application/json; charset=utf-8", "{\"error\":\"llama-server request failed\"}");
+        }
+        std::string content = openai_content_from_response(upstream.body);
+        std::string now = utc_timestamp();
+        int prompt_tokens = openai_token_count(upstream.body, "prompt_tokens");
+        int completion_tokens = openai_token_count(upstream.body, "completion_tokens");
+        std::string finish = openai_finish_reason(upstream.body);
+        long long ms = elapsed_ms(start);
+        std::ostringstream obj;
+        obj << "{\"model\":\"" << json_escape(model) << "\",\"created_at\":\"" << now << "\",";
+        if (req.path == "/api/generate") obj << "\"response\":\"" << json_escape(content) << "\",";
+        else obj << "\"message\":{\"role\":\"assistant\",\"content\":\"" << json_escape(content) << "\"},";
+        obj << "\"done\":true";
+        if (prompt_tokens > 0) obj << ",\"prompt_eval_count\":" << prompt_tokens;
+        if (completion_tokens > 0) obj << ",\"eval_count\":" << completion_tokens;
+        obj << "}";
+        proxy_log("id=" + std::to_string(request_id) + " ollama_out status=200 path=" + req.path +
+                  " model=" + model +
+                  " ms=" + std::to_string(ms) +
+                  " max_tokens=" + std::to_string(limit.value) +
+                  " max_tokens_source=" + limit.source +
+                  " finish_reason=" + finish +
+                  " prompt_tokens=" + std::to_string(prompt_tokens) +
+                  " completion_tokens=" + std::to_string(completion_tokens) +
+                  " content_chars=" + std::to_string(content.size()) +
+                  " upstream_bytes=" + std::to_string(upstream.body.size()));
+        proxy_json_log("{\"id\":" + std::to_string(request_id) +
+                       ",\"event\":\"ollama_complete\",\"path\":\"" + json_escape(req.path) +
+                       "\",\"model\":\"" + json_escape(model) +
+                       "\",\"status\":200,\"ms\":" + std::to_string(ms) +
+                       ",\"max_tokens\":" + std::to_string(limit.value) +
+                       ",\"max_tokens_source\":\"" + json_escape(limit.source) +
+                       "\",\"finish_reason\":\"" + json_escape(finish) +
+                       "\",\"prompt_tokens\":" + std::to_string(prompt_tokens) +
+                       ",\"completion_tokens\":" + std::to_string(completion_tokens) +
+                       ",\"content_chars\":" + std::to_string(content.size()) +
+                       ",\"request_bytes\":" + std::to_string(req.body.size()) +
+                       ",\"upstream_bytes\":" + std::to_string(upstream.body.size()) + "}");
+        if (requested_stream) return http_reply(200, "application/x-ndjson; charset=utf-8", obj.str() + "\n");
+        return http_reply(200, "application/json; charset=utf-8", obj.str());
+    }
+    proxy_log("id=" + std::to_string(request_id) + " unsupported status=404 method=" + req.method + " path=" + req.path);
+    return http_reply(404, "application/json; charset=utf-8", "{\"error\":\"unsupported endpoint\"}");
+}
+
+static int cmd_proxy() {
+    WinsockInit wsa;
+    SOCKET server = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (server == INVALID_SOCKET) throw std::runtime_error("cannot create listener socket");
+    BOOL reuse = TRUE;
+    setsockopt(server, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char *>(&reuse), sizeof(reuse));
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(11434);
+    addr.sin_addr.s_addr = INADDR_ANY;
+    if (bind(server, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) != 0) {
+        closesocket(server);
+        throw std::runtime_error("cannot bind proxy on 0.0.0.0:11434");
+    }
+    if (listen(server, SOMAXCONN) != 0) {
+        closesocket(server);
+        throw std::runtime_error("cannot listen on proxy socket");
+    }
+    std::cout << "C++ Ollama/OpenAI proxy listening on 0.0.0.0:11434 -> 127.0.0.1:8080\n";
+    for (;;) {
+        SOCKET client = accept(server, nullptr, nullptr);
+        if (client == INVALID_SOCKET) continue;
+        std::thread([client]() {
+            unsigned long long request_id = g_request_id.fetch_add(1);
+            auto start = std::chrono::steady_clock::now();
+            try {
+                ParsedRequest req = read_http_request(client);
+                proxy_log("id=" + std::to_string(request_id) + " recv method=" + req.method +
+                          " target=" + req.target +
+                          " path=" + req.path +
+                          " body_bytes=" + std::to_string(req.body.size()));
+                std::string reply = handle_proxy_request(req, request_id);
+                proxy_log("id=" + std::to_string(request_id) + " sent bytes=" + std::to_string(reply.size()) +
+                          " total_ms=" + std::to_string(elapsed_ms(start)));
+                send_all(client, reply);
+            } catch (const std::exception & e) {
+                proxy_log("id=" + std::to_string(request_id) + " exception total_ms=" + std::to_string(elapsed_ms(start)) +
+                          " error=\"" + json_escape(e.what()) + "\"");
+                std::string body = "{\"error\":\"" + json_escape(e.what()) + "\"}";
+                try { send_all(client, http_reply(500, "application/json; charset=utf-8", body)); } catch (...) {}
+            }
+            closesocket(client);
+        }).detach();
+    }
+}
+
+static int cmd_start(bool no_proxy, bool no_preload) {
+    WinsockInit wsa;
+    Settings s;
+    fs::create_directories(path_in_root("logs"));
+    fs::create_directories(path_in_root("state"));
+    fs::create_directories(path_in_root("models"));
+    fs::path llama = path_in_root("bin/llama-server.exe");
+    if (!fs::exists(llama)) throw std::runtime_error("missing " + llama.string());
+
+    stop_pid_file(path_in_root("state/llama-server.pid"), "llama-server");
+    if (!no_proxy) stop_pid_file(path_in_root("state/ollama-proxy.pid"), "ollama-proxy");
+
+    auto models = gguf_files();
+    if (models.empty()) {
+        std::cerr << "warning: no GGUF model in " << path_in_root("models").string() << "\n";
+        no_preload = true;
+    }
+    std::string model = default_model();
+
+    for (int ctx : s.contexts) {
+        write_preset(ctx, s);
+        DWORD pid = start_process(build_llama_server_command(ctx, s), root_dir(), path_in_root("logs/llama-server.out.log"), path_in_root("logs/llama-server.err.log"));
+        write_file(path_in_root("state/llama-server.pid"), std::to_string(pid) + "\n");
+        std::cout << "started llama-server pid " << pid << " with ctx " << ctx << "\n";
+        if (!wait_health(90)) {
+            std::cerr << "llama-server did not become healthy for ctx " << ctx << "\n";
+            stop_pid_file(path_in_root("state/llama-server.pid"), "llama-server");
+            continue;
+        }
+        if (!no_preload && !preload_model(model)) {
+            std::cerr << "preload failed for " << model << ", trying smaller context\n";
+            stop_pid_file(path_in_root("state/llama-server.pid"), "llama-server");
+            continue;
+        }
+        if (!no_proxy) {
+            fs::path self = exe_path();
+            DWORD ppid = start_process(quote_arg(self.string()) + " proxy", root_dir(), path_in_root("logs/ollama-proxy.out.log"), path_in_root("logs/ollama-proxy.err.log"));
+            write_file(path_in_root("state/ollama-proxy.pid"), std::to_string(ppid) + "\n");
+            std::cout << "started C++ proxy pid " << ppid << "\n";
+        }
+        std::cout << "OpenAI: http://127.0.0.1:8080/v1\n";
+        std::cout << "Ollama: http://127.0.0.1:11434/api\n";
+        return 0;
+    }
+    throw std::runtime_error("unable to start llama-server with configured contexts");
+}
+
+static std::string one_line(std::string s, size_t limit = 500) {
+    for (char & c : s) {
+        if (c == '\r' || c == '\n' || c == '\t') c = ' ';
+    }
+    if (s.size() > limit) s = s.substr(0, limit) + "...";
+    return s;
+}
+
+static bool expect_http(const std::string & label, const HttpResponse & r, int min_status = 200, int max_status = 299) {
+    bool ok = r.status >= min_status && r.status <= max_status;
+    std::cout << "[TEST] " << label << " -> HTTP " << r.status << (ok ? " OK" : " FAIL") << "\n";
+    if (!r.body.empty()) std::cout << "       " << one_line(r.body) << "\n";
+    return ok;
+}
+
+static bool run_api_tests() {
+    bool ok = true;
+    try {
+        ok = expect_http("llama health", http_request("127.0.0.1", 8080, "GET", "/health")) && ok;
+        ok = expect_http("OpenAI GET /v1/models", http_request("127.0.0.1", 8080, "GET", "/v1/models")) && ok;
+
+        std::string model = default_model();
+        std::string openai_body =
+            "{\"model\":\"" + json_escape(model) +
+            "\",\"messages\":[{\"role\":\"system\",\"content\":\"Antwort kurz.\"},{\"role\":\"user\",\"content\":\"Antworte exakt mit OK.\"}],\"max_tokens\":8,\"stream\":false}";
+        ok = expect_http("OpenAI POST /v1/chat/completions",
+                         http_request("127.0.0.1", 8080, "POST", "/v1/chat/completions", openai_body, {{"Content-Type", "application/json"}})) && ok;
+        ok = expect_http("OpenAI via Ollama port POST /v1/chat/completions",
+                         http_request("127.0.0.1", 11434, "POST", "/v1/chat/completions", openai_body, {{"Content-Type", "application/json"}})) && ok;
+
+        ok = expect_http("Ollama GET /api/version", http_request("127.0.0.1", 11434, "GET", "/api/version")) && ok;
+        ok = expect_http("Ollama GET /api/tags", http_request("127.0.0.1", 11434, "GET", "/api/tags")) && ok;
+
+        std::string weird = "\\u00f6p\\u00fc\\u00fc\\u00fc\\u00b4+#.--..,\\\"\\u00a7$%&/=)(/=? -- antworte nur: EDGE_OK";
+        std::string ollama_body =
+            "{\"model\":\"" + json_escape(model) +
+            "\",\"messages\":[{\"role\":\"user\",\"content\":\"" + weird +
+            "\"}],\"options\":{\"num_predict\":16,\"temperature\":0},\"stream\":false}";
+        ok = expect_http("Ollama POST /api/chat weird UTF-8 payload",
+                         http_request("127.0.0.1", 11434, "POST", "/api/chat", ollama_body, {{"Content-Type", "application/json"}})) && ok;
+
+        std::string generate_body =
+            "{\"model\":\"" + json_escape(model) +
+            "\",\"prompt\":\"Generate endpoint smoke test: antworte kurz.\",\"options\":{\"num_predict\":12,\"temperature\":0},\"stream\":false}";
+        ok = expect_http("Ollama POST /api/generate",
+                         http_request("127.0.0.1", 11434, "POST", "/api/generate", generate_body, {{"Content-Type", "application/json"}})) && ok;
+    } catch (const std::exception & e) {
+        std::cerr << "[TEST] exception: " << e.what() << "\n";
+        ok = false;
+    }
+    return ok;
+}
+
+static void print_devices() {
+    fs::path llama = path_in_root("bin/llama-server.exe");
+    std::cout << "\n=== llama.cpp devices ===\n";
+    std::string cmd = quote_arg(llama.string()) + " --list-devices";
+    std::system(cmd.c_str());
+    std::cout << "\n=== nvidia-smi ===\n";
+    std::system("nvidia-smi --query-gpu=name,memory.used,memory.free,memory.total,utilization.gpu --format=csv,noheader");
+}
+
+static int cmd_run(bool exit_after_tests) {
+    WinsockInit wsa;
+    SetConsoleCtrlHandler(console_handler, TRUE);
+    Settings s;
+    fs::create_directories(path_in_root("logs"));
+    fs::create_directories(path_in_root("state"));
+    fs::create_directories(path_in_root("models"));
+
+    fs::path llama = path_in_root("bin/llama-server.exe");
+    if (!fs::exists(llama)) throw std::runtime_error("missing " + llama.string());
+    if (gguf_files().empty()) throw std::runtime_error("no GGUF model found in " + path_in_root("models").string());
+
+    std::cout << "============================================================\n";
+    std::cout << " llama.cpp RTX 5070 local server\n";
+    std::cout << " Backend: " << backend_name() << "  Preferred device: " << (preferred_device().empty() ? "CPU" : preferred_device()) << "\n";
+    std::cout << " Model:   " << default_model() << "\n";
+    std::cout << " RAM mode: --no-mmap (model is loaded into RAM), VRAM mode: --fit + GPU offload\n";
+    std::cout << " APIs:    OpenAI http://127.0.0.1:8080/v1  |  Ollama http://127.0.0.1:11434/api\n";
+    std::cout << "============================================================\n";
+    print_devices();
+
+    stop_pid_file(path_in_root("state/ollama-proxy.pid"), "ollama-proxy");
+    stop_pid_file(path_in_root("state/llama-server.pid"), "llama-server");
+
+    PROCESS_INFORMATION pi{};
+    bool started = false;
+    int used_ctx = 0;
+    for (int ctx : s.contexts) {
+        write_preset(ctx, s);
+        std::cout << "\n[START] Trying context " << ctx << " with " << backend_name() << " / " << preferred_device() << "\n";
+        pi = start_process_console(build_llama_server_command(ctx, s), root_dir());
+        g_child_pid = pi.dwProcessId;
+        write_file(path_in_root("state/llama-server.pid"), std::to_string(pi.dwProcessId) + "\n");
+
+        if (!wait_health(180)) {
+            std::cerr << "[START] Server did not become healthy at ctx " << ctx << "\n";
+            TerminateProcess(pi.hProcess, 1);
+            WaitForSingleObject(pi.hProcess, 15000);
+            CloseHandle(pi.hThread);
+            CloseHandle(pi.hProcess);
+            continue;
+        }
+        std::cout << "[START] Server is healthy. Loading model into RAM/VRAM...\n";
+        if (!preload_model(default_model())) {
+            std::cerr << "[START] Model preload failed at ctx " << ctx << ", trying lower context.\n";
+            TerminateProcess(pi.hProcess, 1);
+            WaitForSingleObject(pi.hProcess, 15000);
+            CloseHandle(pi.hThread);
+            CloseHandle(pi.hProcess);
+            continue;
+        }
+        used_ctx = ctx;
+        started = true;
+        break;
+    }
+
+    if (!started) throw std::runtime_error("unable to start and preload model with any configured context");
+
+    std::thread proxy_thread([]() {
+        try {
+            cmd_proxy();
+        } catch (const std::exception & e) {
+            std::cerr << "[PROXY] " << e.what() << "\n";
+        }
+    });
+    proxy_thread.detach();
+    std::this_thread::sleep_for(std::chrono::seconds(2));
+
+    std::cout << "\n[TEST] Running built-in API tests...\n";
+    bool tests_ok = run_api_tests();
+    std::cout << "\n=== GPU after load ===\n";
+    std::system("nvidia-smi --query-gpu=name,memory.used,memory.free,memory.total,utilization.gpu --format=csv,noheader");
+
+    std::cout << "\n============================================================\n";
+    std::cout << " READY context=" << used_ctx << " tests=" << (tests_ok ? "OK" : "FAILED") << "\n";
+    std::cout << " OpenAI base: http://127.0.0.1:8080/v1\n";
+    std::cout << " Ollama API:  http://127.0.0.1:11434/api\n";
+    std::cout << " LAN:         use this machine's LAN IP with ports 8080 or 11434\n";
+    std::cout << " Stop:        Ctrl+C in this terminal\n";
+    std::cout << "============================================================\n";
+
+    if (exit_after_tests) {
+        TerminateProcess(pi.hProcess, 0);
+        WaitForSingleObject(pi.hProcess, 15000);
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+        g_child_pid = 0;
+        std::error_code ec;
+        fs::remove(path_in_root("state/llama-server.pid"), ec);
+        return tests_ok ? 0 : 2;
+    }
+
+    while (!g_stop_requested) {
+        DWORD code = STILL_ACTIVE;
+        if (!GetExitCodeProcess(pi.hProcess, &code) || code != STILL_ACTIVE) break;
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+    }
+    TerminateProcess(pi.hProcess, 0);
+    WaitForSingleObject(pi.hProcess, 15000);
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    g_child_pid = 0;
+    std::error_code ec;
+    fs::remove(path_in_root("state/llama-server.pid"), ec);
+    return tests_ok ? 0 : 2;
+}
+
+static int cmd_stop() {
+    stop_pid_file(path_in_root("state/ollama-proxy.pid"), "ollama-proxy");
+    stop_pid_file(path_in_root("state/llama-server.pid"), "llama-server");
+    return 0;
+}
+
+static int cmd_status() {
+    WinsockInit wsa;
+    auto lp = read_pid(path_in_root("state/llama-server.pid"));
+    auto pp = read_pid(path_in_root("state/ollama-proxy.pid"));
+    std::cout << "root: " << root_dir().string() << "\n";
+    std::cout << "llama-server pid: " << (lp ? std::to_string(*lp) : "-") << " alive=" << (lp && process_alive(*lp) ? "yes" : "no") << "\n";
+    std::cout << "ollama-proxy pid: " << (pp ? std::to_string(*pp) : "-") << " alive=" << (pp && process_alive(*pp) ? "yes" : "no") << "\n";
+    std::cout << "default model: " << default_model() << "\n";
+    std::cout << "models:\n";
+    for (const auto & p : gguf_files()) std::cout << "  " << p.filename().string() << " (" << fs::file_size(p) << " bytes)\n";
+    std::cout << "firewall rules:\n";
+    for (const auto & rule : FIREWALL_RULES) {
+        std::cout << "  " << rule.name << ": " << (firewall_rule_exists(rule) ? "present" : "missing") << "\n";
+    }
+    try {
+        auto h = http_request("127.0.0.1", 8080, "GET", "/health");
+        std::cout << "llama health: HTTP " << h.status << " " << trim(h.body) << "\n";
+    } catch (const std::exception & e) {
+        std::cout << "llama health: down (" << e.what() << ")\n";
+    }
+    try {
+        auto v = http_request("127.0.0.1", 11434, "GET", "/api/version");
+        std::cout << "proxy version: HTTP " << v.status << " " << trim(v.body) << "\n";
+    } catch (const std::exception & e) {
+        std::cout << "proxy version: down (" << e.what() << ")\n";
+    }
+    return 0;
+}
+
+static int cmd_firewall(bool elevated_child) {
+    std::cout << "firewall target: Windows Private profile, LocalSubnet only, TCP ports 8080 and 11434\n";
+    bool all_present = true;
+    for (const auto & rule : FIREWALL_RULES) {
+        if (!firewall_rule_exists(rule)) all_present = false;
+    }
+    if (all_present) {
+        std::cout << "all firewall rules are already present\n";
+        return 0;
+    }
+    if (!is_process_elevated()) {
+        if (elevated_child) throw std::runtime_error("firewall setup still is not elevated");
+        return request_firewall_elevation();
+    }
+    int rc = 0;
+    for (const auto & rule : FIREWALL_RULES) rc |= add_firewall_rule(rule);
+    return rc;
+}
+
+static int cmd_switch(const std::string & model, bool no_preload) {
+    WinsockInit wsa;
+    std::string selected = model;
+    for (const auto & p : gguf_files()) {
+        std::string stem = p.stem().string();
+        if (stem == model || stem.find(model) != std::string::npos) {
+            selected = stem;
+            break;
+        }
+    }
+    write_default_model(selected);
+    std::cout << "default model set to " << selected << "\n";
+    if (!no_preload && !preload_model(selected)) return 2;
+    return 0;
+}
+
+static int cmd_bench(const std::string & prompt) {
+    WinsockInit wsa;
+    std::string model = default_model();
+    if (model.empty()) throw std::runtime_error("no default model");
+    std::string body = "{\"model\":\"" + json_escape(model) + "\",\"messages\":[{\"role\":\"user\",\"content\":\"" + json_escape(prompt) + "\"}],\"max_tokens\":128,\"stream\":false}";
+    auto t0 = std::chrono::steady_clock::now();
+    auto r = http_request("127.0.0.1", 8080, "POST", "/v1/chat/completions", body, {{"Content-Type", "application/json"}});
+    auto t1 = std::chrono::steady_clock::now();
+    std::chrono::duration<double> dt = t1 - t0;
+    std::cout << openai_content_from_response(r.body) << "\n\n";
+    int toks = openai_token_count(r.body, "completion_tokens");
+    std::cout << "elapsed: " << dt.count() << "s\n";
+    if (toks > 0) std::cout << "completion tokens: " << toks << "\ntokens/s: " << (toks / dt.count()) << "\n";
+    return 0;
+}
+
+static int cmd_downloads() {
+    fs::path d = path_in_root("downloads");
+    if (!fs::exists(d)) {
+        std::cout << "downloads directory does not exist\n";
+        return 0;
+    }
+    for (const auto & e : fs::directory_iterator(d)) {
+        std::cout << (e.is_directory() ? "[dir]  " : "[file] ") << e.path().filename().string();
+        if (e.is_regular_file()) std::cout << "  " << fs::file_size(e.path()) << " bytes";
+        std::cout << "\n";
+    }
+    return 0;
+}
+
+static void usage() {
+    std::cout <<
+        "lamacpp-local commands:\n"
+        "  run [--exit-after-tests]\n"
+        "  start [--no-proxy] [--no-preload]\n"
+        "  stop\n"
+        "  status\n"
+        "  switch <model-fragment> [--no-preload]\n"
+        "  bench [prompt]\n"
+        "  proxy\n"
+        "  downloads\n"
+        "  firewall\n";
+}
+
+int main(int argc, char ** argv) {
+    SetConsoleOutputCP(CP_UTF8);
+    try {
+        if (argc < 2) {
+            usage();
+            return 1;
+        }
+        std::string cmd = lower(argv[1]);
+        if (cmd == "proxy") return cmd_proxy();
+        if (cmd == "run") {
+            bool exit_after_tests = false;
+            for (int i = 2; i < argc; ++i) {
+                if (lower(argv[i]) == "--exit-after-tests") exit_after_tests = true;
+            }
+            return cmd_run(exit_after_tests);
+        }
+        if (cmd == "start") {
+            bool no_proxy = false, no_preload = false;
+            for (int i = 2; i < argc; ++i) {
+                std::string a = lower(argv[i]);
+                if (a == "--no-proxy") no_proxy = true;
+                if (a == "--no-preload") no_preload = true;
+            }
+            return cmd_start(no_proxy, no_preload);
+        }
+        if (cmd == "stop") return cmd_stop();
+        if (cmd == "status") return cmd_status();
+        if (cmd == "firewall") {
+            bool elevated_child = false;
+            for (int i = 2; i < argc; ++i) if (lower(argv[i]) == "--elevated") elevated_child = true;
+            return cmd_firewall(elevated_child);
+        }
+        if (cmd == "switch") {
+            if (argc < 3) throw std::runtime_error("switch needs a model name or fragment");
+            bool no_preload = false;
+            for (int i = 3; i < argc; ++i) if (lower(argv[i]) == "--no-preload") no_preload = true;
+            return cmd_switch(argv[2], no_preload);
+        }
+        if (cmd == "bench") {
+            std::string prompt = argc >= 3 ? argv[2] : "Schreibe eine kurze technische Zusammenfassung von llama.cpp.";
+            return cmd_bench(prompt);
+        }
+        if (cmd == "downloads") return cmd_downloads();
+        usage();
+        return 1;
+    } catch (const std::exception & e) {
+        std::cerr << "error: " << e.what() << "\n";
+        return 1;
+    }
+}
