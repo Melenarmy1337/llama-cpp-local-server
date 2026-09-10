@@ -42,7 +42,30 @@ struct Settings {
     int fit_target_mib = 512;
     int batch_size = 2048;
     int ubatch_size = 512;
+    bool kv_offload = false;
+    std::string cache_type_k = "q8_0";
+    std::string cache_type_v = "q8_0";
+    std::string profile = "long";
 };
+
+static Settings settings_for_profile(const std::string & profile) {
+    Settings s;
+    if (profile == "fast") {
+        s.contexts = {65536, 49152, 32768, 16384, 8192};
+        s.fit_target_mib = 512;
+        s.kv_offload = true;
+        s.cache_type_k = "q4_0";
+        s.cache_type_v = "q4_0";
+        s.profile = "fast";
+    } else if (profile == "long") {
+        s.fit_target_mib = 2048;
+        s.kv_offload = false;
+        s.profile = "long";
+    } else {
+        throw std::runtime_error("unknown server profile: " + profile);
+    }
+    return s;
+}
 
 struct HttpResponse {
     int status = 0;
@@ -446,7 +469,8 @@ static void proxy_json_log(const std::string & json_object) {
 }
 
 static HttpResponse http_request(const std::string & host, int port, const std::string & method, const std::string & target,
-                                 const std::string & body = {}, const std::map<std::string, std::string> & headers = {}) {
+                                 const std::string & body = {}, const std::map<std::string, std::string> & headers = {},
+                                 DWORD timeout_ms = 900000) {
     addrinfo hints{};
     hints.ai_family = AF_INET;
     hints.ai_socktype = SOCK_STREAM;
@@ -460,7 +484,6 @@ static HttpResponse http_request(const std::string & host, int port, const std::
         freeaddrinfo(result);
         throw std::runtime_error("cannot create socket");
     }
-    DWORD timeout_ms = 900000;
     setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char *>(&timeout_ms), sizeof(timeout_ms));
     setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char *>(&timeout_ms), sizeof(timeout_ms));
     if (connect(sock, result->ai_addr, int(result->ai_addrlen)) != 0) {
@@ -590,13 +613,14 @@ static void write_preset(int ctx, const Settings & s) {
     out << "version = 1\n\n";
     out << "[*]\n";
     out << "c = " << ctx << "\n";
-    out << "n-gpu-layers = auto\n";
+    out << "n-gpu-layers = 999\n";
     out << "fit = on\n";
     out << "fit-target = " << s.fit_target_mib << "\n";
     out << "flash-attn = auto\n";
-    out << "kv-offload = true\n";
-    out << "cache-type-k = q8_0\n";
-    out << "cache-type-v = q8_0\n";
+    out << "kv-offload = " << (s.kv_offload ? "true" : "false") << "\n";
+    out << "cache-type-k = " << s.cache_type_k << "\n";
+    out << "cache-type-v = " << s.cache_type_v << "\n";
+    out << "reasoning = off\n";
     out << "threads = " << s.threads << "\n";
     out << "threads-batch = " << s.threads_batch << "\n";
     out << "parallel = " << s.parallel << "\n";
@@ -753,6 +777,7 @@ static std::string build_llama_server_command(int ctx, const Settings & s) {
         << " --models-preset " << quote_arg(path_in_root("config/models.preset.ini").string())
         << " --prio 2"
         << " --poll 75"
+        << " --reasoning off"
         << " --no-mmap";
     std::string dev = preferred_device();
     if (!dev.empty()) cmd << " --device " << dev;
@@ -1100,9 +1125,9 @@ static int cmd_proxy() {
     }
 }
 
-static int cmd_start(bool no_proxy, bool no_preload) {
+static int cmd_start(bool no_proxy, bool no_preload, const std::string & profile) {
     WinsockInit wsa;
-    Settings s;
+    Settings s = settings_for_profile(profile);
     fs::create_directories(path_in_root("logs"));
     fs::create_directories(path_in_root("state"));
     fs::create_directories(path_in_root("models"));
@@ -1123,7 +1148,7 @@ static int cmd_start(bool no_proxy, bool no_preload) {
         write_preset(ctx, s);
         DWORD pid = start_process(build_llama_server_command(ctx, s), root_dir(), path_in_root("logs/llama-server.out.log"), path_in_root("logs/llama-server.err.log"));
         write_file(path_in_root("state/llama-server.pid"), std::to_string(pid) + "\n");
-        std::cout << "started llama-server pid " << pid << " with ctx " << ctx << "\n";
+        std::cout << "started llama-server pid " << pid << " profile=" << s.profile << " ctx=" << ctx << "\n";
         if (!wait_health(90)) {
             std::cerr << "llama-server did not become healthy for ctx " << ctx << "\n";
             stop_pid_file(path_in_root("state/llama-server.pid"), "llama-server");
@@ -1209,10 +1234,10 @@ static void print_devices() {
     std::system("nvidia-smi --query-gpu=name,memory.used,memory.free,memory.total,utilization.gpu --format=csv,noheader");
 }
 
-static int cmd_run(bool exit_after_tests) {
+static int cmd_run(bool exit_after_tests, const std::string & profile) {
     WinsockInit wsa;
     SetConsoleCtrlHandler(console_handler, TRUE);
-    Settings s;
+    Settings s = settings_for_profile(profile);
     fs::create_directories(path_in_root("logs"));
     fs::create_directories(path_in_root("state"));
     fs::create_directories(path_in_root("models"));
@@ -1225,6 +1250,7 @@ static int cmd_run(bool exit_after_tests) {
     std::cout << " llama.cpp RTX 5070 local server\n";
     std::cout << " Backend: " << backend_name() << "  Preferred device: " << (preferred_device().empty() ? "CPU" : preferred_device()) << "\n";
     std::cout << " Model:   " << default_model() << "\n";
+    std::cout << " Profile: " << s.profile << "  KV: " << (s.kv_offload ? "GPU " + s.cache_type_k : "RAM " + s.cache_type_k) << "\n";
     std::cout << " RAM mode: --no-mmap (model is loaded into RAM), VRAM mode: --fit + GPU offload\n";
     std::cout << " APIs:    OpenAI http://127.0.0.1:8080/v1  |  Ollama http://127.0.0.1:11434/api\n";
     std::cout << "============================================================\n";
@@ -1386,6 +1412,281 @@ static int cmd_switch(const std::string & model, bool no_preload) {
     return 0;
 }
 
+struct CompareProfile {
+    std::string name;
+    int context = 65536;
+    int fit_target_mib = 2048;
+    bool gpu_kv = false;
+    std::string cache_type = "q8_0";
+};
+
+struct CompareResult {
+    std::string case_id;
+    std::string model;
+    std::string profile;
+    int context = 0;
+    int http_status = 0;
+    double elapsed_seconds = 0.0;
+    int prompt_tokens = 0;
+    int completion_tokens = 0;
+    int output_words = 0;
+    std::string finish_reason;
+    std::string status;
+    std::string response;
+    std::string error;
+};
+
+static int compare_fit_target(const fs::path & model) {
+    return lower(model.filename().string()).find("lowgpu") != std::string::npos ? 512 : 2048;
+}
+
+static std::string compare_slug(std::string value) {
+    for (char & c : value) {
+        if (!std::isalnum(static_cast<unsigned char>(c))) c = '_';
+    }
+    return value;
+}
+
+static int count_words(const std::string & value) {
+    int count = 0;
+    bool in_word = false;
+    for (unsigned char c : value) {
+        bool word = !std::isspace(c);
+        if (word && !in_word) ++count;
+        in_word = word;
+    }
+    return count;
+}
+
+static void terminate_process(DWORD pid) {
+    if (!pid) return;
+    HANDLE h = OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, FALSE, pid);
+    if (!h) return;
+    TerminateProcess(h, 0);
+    WaitForSingleObject(h, 30000);
+    CloseHandle(h);
+}
+
+static bool wait_health_on_port(int port, int seconds) {
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(seconds);
+    while (std::chrono::steady_clock::now() < deadline) {
+        try {
+            auto r = http_request("127.0.0.1", port, "GET", "/health");
+            if (r.status >= 200 && r.status < 500) return true;
+        } catch (...) {}
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+    }
+    return false;
+}
+
+static std::string build_compare_server_command(const fs::path & model, int port, const CompareProfile & profile) {
+    fs::path llama = path_in_root("bin/llama-server.exe");
+    std::ostringstream cmd;
+    cmd << quote_arg(llama.string())
+        << " --model " << quote_arg(model.string())
+        << " --alias " << quote_arg(model.stem().string())
+        << " --host 127.0.0.1"
+        << " --port " << port
+        << " --ctx-size " << profile.context
+        << " --n-gpu-layers 999"
+        << " --fit on"
+        << " --fit-target " << profile.fit_target_mib
+        << " --flash-attn on"
+        << " --cache-type-k " << profile.cache_type
+        << " --cache-type-v " << profile.cache_type
+        << " --threads 8"
+        << " --threads-batch 8"
+        << " --parallel 1"
+        << " --batch-size 2048"
+        << " --ubatch-size 512"
+        << " --prio 2"
+        << " --poll 75"
+        << " --no-mmap"
+        << " --jinja"
+        << " --reasoning off";
+    if (profile.gpu_kv) cmd << " --kv-offload";
+    else cmd << " --no-kv-offload";
+    std::string dev = preferred_device();
+    if (!dev.empty()) cmd << " --device " << dev;
+    return cmd.str();
+}
+
+static void append_compare_result(const fs::path & file, const CompareResult & result) {
+    std::ostringstream out;
+    out << "{\"timestamp\":\"" << utc_timestamp() << "\""
+        << ",\"case_id\":\"" << json_escape(result.case_id) << "\""
+        << ",\"model\":\"" << json_escape(result.model) << "\""
+        << ",\"profile\":\"" << json_escape(result.profile) << "\""
+        << ",\"context\":" << result.context
+        << ",\"status\":\"" << json_escape(result.status) << "\""
+        << ",\"http_status\":" << result.http_status
+        << ",\"elapsed_seconds\":" << result.elapsed_seconds
+        << ",\"prompt_tokens\":" << result.prompt_tokens
+        << ",\"completion_tokens\":" << result.completion_tokens
+        << ",\"output_words\":" << result.output_words
+        << ",\"finish_reason\":\"" << json_escape(result.finish_reason) << "\""
+        << ",\"response\":\"" << json_escape(result.response) << "\""
+        << ",\"error\":\"" << json_escape(result.error) << "\"}\n";
+    std::lock_guard<std::mutex> lock(g_log_mutex);
+    std::ofstream stream(file, std::ios::binary | std::ios::app);
+    if (!stream) throw std::runtime_error("cannot append " + file.string());
+    stream << out.str();
+}
+
+static bool compare_case_finished(const fs::path & file, const std::string & case_id) {
+    std::string marker = "\"case_id\":\"" + json_escape(case_id) + "\",\"model\"";
+    std::string content = read_file(file);
+    size_t pos = 0;
+    while ((pos = content.find(marker, pos)) != std::string::npos) {
+        size_t line_end = content.find('\n', pos);
+        std::string line = content.substr(pos, line_end == std::string::npos ? std::string::npos : line_end - pos);
+        if (line.find("\"status\":\"ok\"") != std::string::npos) return true;
+        pos += marker.size();
+    }
+    return false;
+}
+
+static CompareResult run_compare_request(int port, const fs::path & model, const CompareProfile & profile,
+                                         const std::string & case_id, const std::string & prompt, int max_tokens) {
+    CompareResult result;
+    result.case_id = case_id;
+    result.model = model.stem().string();
+    result.profile = profile.name;
+    result.context = profile.context;
+    std::string body = "{\"model\":\"" + json_escape(result.model) + "\",\"messages\":[{\"role\":\"user\",\"content\":\"" + json_escape(prompt) + "\"}],\"temperature\":0,\"max_tokens\":" + std::to_string(max_tokens) + ",\"stream\":false}";
+    auto started = std::chrono::steady_clock::now();
+    try {
+        DWORD timeout_ms = profile.context >= 65536 ? 43200000 : 7200000;
+        auto response = http_request("127.0.0.1", port, "POST", "/v1/chat/completions", body, {{"Content-Type", "application/json"}}, timeout_ms);
+        result.elapsed_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+        result.http_status = response.status;
+        result.response = openai_content_from_response(response.body);
+        result.prompt_tokens = openai_token_count(response.body, "prompt_tokens");
+        result.completion_tokens = openai_token_count(response.body, "completion_tokens");
+        result.output_words = count_words(result.response);
+        result.finish_reason = openai_finish_reason(response.body);
+        result.status = response.status >= 200 && response.status < 300 ? "ok" : "http_error";
+        if (result.status != "ok") result.error = log_preview(response.body, 1000);
+    } catch (const std::exception & e) {
+        result.elapsed_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+        result.status = "request_error";
+        result.error = e.what();
+    }
+    return result;
+}
+
+static std::string synthetic_context_prompt(int context) {
+    int repetitions = std::max(1, (context - 4096) / 2);
+    std::string prompt;
+    prompt.reserve(size_t(repetitions) * 11 + 256);
+    prompt = "Lies den folgenden synthetischen Kontext. Antworte danach ausschliesslich mit CONTEXT_OK.\n\n";
+    for (int i = 0; i < repetitions; ++i) prompt += " alpha beta";
+    prompt += "\n\nPruefung: Antworte ausschliesslich mit CONTEXT_OK.";
+    return prompt;
+}
+
+static bool model_matches(const fs::path & model, const std::string & fragment) {
+    return fragment.empty() || lower(model.filename().string()).find(lower(fragment)) != std::string::npos;
+}
+
+static int run_model_server_cases(const fs::path & model, const CompareProfile & profile,
+                                  const std::vector<std::pair<std::string, std::pair<std::string, int>>> & cases,
+                                  const fs::path & result_file, bool resume, int port) {
+    std::string stem = model.stem().string();
+    bool has_work = false;
+    for (const auto & item : cases) {
+        if (!resume || !compare_case_finished(result_file, stem + "/" + profile.name + "/" + item.first)) {
+            has_work = true;
+            break;
+        }
+    }
+    if (!has_work) {
+        std::cout << "resume: " << stem << " " << profile.name << " already complete\n";
+        return 0;
+    }
+
+    fs::path run_dir = result_file.parent_path() / compare_slug(stem + "_" + profile.name + "_c" + std::to_string(profile.context));
+    DWORD pid = start_process(build_compare_server_command(model, port, profile), root_dir(), run_dir / "server.out.log", run_dir / "server.err.log");
+    std::cout << "start " << stem << " profile=" << profile.name << " context=" << profile.context << " pid=" << pid << "\n";
+    if (!wait_health_on_port(port, 600)) {
+        CompareResult failed;
+        failed.case_id = stem + "/" + profile.name + "/startup";
+        failed.model = stem;
+        failed.profile = profile.name;
+        failed.context = profile.context;
+        failed.status = "startup_error";
+        failed.error = "health endpoint did not become ready within 600 seconds";
+        append_compare_result(result_file, failed);
+        terminate_process(pid);
+        return 1;
+    }
+
+    int failures = 0;
+    for (const auto & item : cases) {
+        std::string case_id = stem + "/" + profile.name + "/" + item.first;
+        if (resume && compare_case_finished(result_file, case_id)) continue;
+        CompareResult result = run_compare_request(port, model, profile, case_id, item.second.first, item.second.second);
+        append_compare_result(result_file, result);
+        std::cout << "  " << item.first << " status=" << result.status << " http=" << result.http_status
+                  << " elapsed=" << result.elapsed_seconds << "s output=" << result.completion_tokens << " tok"
+                  << " words=" << result.output_words << " finish=" << result.finish_reason << "\n";
+        if (result.status != "ok") ++failures;
+    }
+    terminate_process(pid);
+    return failures;
+}
+
+static int cmd_compare(const std::string & fragment, bool resume) {
+    WinsockInit wsa;
+    fs::path run_dir = path_in_root("logs/model-comparison");
+    fs::create_directories(run_dir);
+    fs::path result_file = run_dir / "results.jsonl";
+    std::vector<std::pair<std::string, std::pair<std::string, int>>> cases = {
+        {"speed_128", {"Gib das Wort alpha genau 128-mal aus, nur durch einzelne Leerzeichen getrennt. Gib keine anderen Zeichen aus.", 256}},
+        {"reasoning_json", {"Ein Team hat 5 Aufgaben. Zwei dauern je 3 Stunden, drei dauern je 2 Stunden. Erzeuge ausschliesslich valides JSON mit den Schluesseln total_hours, tasks und explanation. Keine Markdown-Umrandung.", 512}},
+        {"trees_1000_words", {"Schreibe einen zusammenhaengenden deutschen Sachtext mit genau 1000 Woertern ueber Baeume. Keine Ueberschrift, keine Listen, kein Nachwort. Beende den Text erst nach dem tausendsten Wort.", 2048}},
+    };
+    int failures = 0;
+    int tested = 0;
+    for (const auto & model : gguf_files()) {
+        if (!model_matches(model, fragment)) continue;
+        ++tested;
+        if (lower(model.filename().string()).find("lowgpu") != std::string::npos) {
+            CompareProfile fast_profile{"fast_gpu_kv_q4", 65536, 512, true, "q4_0"};
+            failures += run_model_server_cases(model, fast_profile, {cases.front()}, result_file, resume, 18080);
+        }
+        CompareProfile profile{"standard_host_kv_q8", 65536, compare_fit_target(model), false, "q8_0"};
+        failures += run_model_server_cases(model, profile, cases, result_file, resume, 18080);
+    }
+    if (!tested) throw std::runtime_error("no model matches '" + fragment + "'");
+    std::cout << "comparison results: " << result_file.string() << "\n";
+    return failures ? 2 : 0;
+}
+
+static int cmd_longtest(const std::string & fragment, bool resume) {
+    WinsockInit wsa;
+    fs::path run_dir = path_in_root("logs/full-context");
+    fs::create_directories(run_dir);
+    fs::path result_file = run_dir / "results.jsonl";
+    const std::vector<int> contexts = {65536, 131072, 262144};
+    int failures = 0;
+    int tested = 0;
+    for (const auto & model : gguf_files()) {
+        if (!model_matches(model, fragment)) continue;
+        ++tested;
+        for (int context : contexts) {
+            CompareProfile profile{"full_context_host_kv_q8", context, compare_fit_target(model), false, "q8_0"};
+            std::vector<std::pair<std::string, std::pair<std::string, int>>> cases = {
+                {"depth_" + std::to_string(context - 4096), {synthetic_context_prompt(context), 64}},
+            };
+            failures += run_model_server_cases(model, profile, cases, result_file, resume, 18080);
+        }
+    }
+    if (!tested) throw std::runtime_error("no model matches '" + fragment + "'");
+    std::cout << "full-context results: " << result_file.string() << "\n";
+    return failures ? 2 : 0;
+}
+
 static int cmd_bench(const std::string & prompt) {
     WinsockInit wsa;
     std::string model = default_model();
@@ -1419,12 +1720,14 @@ static int cmd_downloads() {
 static void usage() {
     std::cout <<
         "lamacpp-local commands:\n"
-        "  run [--exit-after-tests]\n"
-        "  start [--no-proxy] [--no-preload]\n"
+        "  run [--fast|--long] [--exit-after-tests]\n"
+        "  start [--fast|--long] [--no-proxy] [--no-preload]\n"
         "  stop\n"
         "  status\n"
         "  switch <model-fragment> [--no-preload]\n"
         "  bench [prompt]\n"
+        "  compare [--model <fragment>] [--resume]\n"
+        "  longtest [--model <fragment>] [--resume]\n"
         "  proxy\n"
         "  downloads\n"
         "  firewall\n";
@@ -1441,19 +1744,28 @@ int main(int argc, char ** argv) {
         if (cmd == "proxy") return cmd_proxy();
         if (cmd == "run") {
             bool exit_after_tests = false;
+            std::string profile = "fast";
             for (int i = 2; i < argc; ++i) {
-                if (lower(argv[i]) == "--exit-after-tests") exit_after_tests = true;
+                std::string a = lower(argv[i]);
+                if (a == "--exit-after-tests") exit_after_tests = true;
+                else if (a == "--fast") profile = "fast";
+                else if (a == "--long") profile = "long";
+                else throw std::runtime_error("unknown run option: " + std::string(argv[i]));
             }
-            return cmd_run(exit_after_tests);
+            return cmd_run(exit_after_tests, profile);
         }
         if (cmd == "start") {
             bool no_proxy = false, no_preload = false;
+            std::string profile = "fast";
             for (int i = 2; i < argc; ++i) {
                 std::string a = lower(argv[i]);
                 if (a == "--no-proxy") no_proxy = true;
-                if (a == "--no-preload") no_preload = true;
+                else if (a == "--no-preload") no_preload = true;
+                else if (a == "--fast") profile = "fast";
+                else if (a == "--long") profile = "long";
+                else throw std::runtime_error("unknown start option: " + std::string(argv[i]));
             }
-            return cmd_start(no_proxy, no_preload);
+            return cmd_start(no_proxy, no_preload, profile);
         }
         if (cmd == "stop") return cmd_stop();
         if (cmd == "status") return cmd_status();
@@ -1471,6 +1783,22 @@ int main(int argc, char ** argv) {
         if (cmd == "bench") {
             std::string prompt = argc >= 3 ? argv[2] : "Schreibe eine kurze technische Zusammenfassung von llama.cpp.";
             return cmd_bench(prompt);
+        }
+        if (cmd == "compare" || cmd == "longtest") {
+            std::string fragment;
+            bool resume = false;
+            for (int i = 2; i < argc; ++i) {
+                std::string a = lower(argv[i]);
+                if (a == "--resume") {
+                    resume = true;
+                } else if (a == "--model") {
+                    if (i + 1 >= argc) throw std::runtime_error("--model needs a fragment");
+                    fragment = argv[++i];
+                } else {
+                    throw std::runtime_error("unknown " + cmd + " option: " + std::string(argv[i]));
+                }
+            }
+            return cmd == "compare" ? cmd_compare(fragment, resume) : cmd_longtest(fragment, resume);
         }
         if (cmd == "downloads") return cmd_downloads();
         usage();

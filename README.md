@@ -76,12 +76,17 @@ performs API smoke tests, then keeps the server alive. Stop it with `Ctrl+C`.
 ## Commands
 
 ```bat
-start.bat                 Run in the foreground, including self-tests
-start.bat start           Start llama.cpp and the proxy in the background
+start.bat                 Run the fast profile in the foreground, including self-tests
+start.bat --long          Run the long-context profile in the foreground
+start.bat start           Start the fast profile in the background
+start.bat start --long    Start the long-context profile in the background
 start.bat stop            Stop both background processes
 start.bat status          Show process, model, firewall, and API status
 start.bat switch Qwen     Select the first GGUF whose name contains Qwen
 start.bat bench           Run a small direct OpenAI API benchmark
+start.bat compare         Compare all installed GGUF models and save responses/timings
+start.bat longtest        Run 64K, 128K, and 262K synthetic context tests
+start.bat longtest --resume  Continue completed long-context work without repetition
 start.bat downloads       List local files in downloads
 start.bat firewall        Add Private/LocalSubnet firewall rules using UAC
 ```
@@ -143,21 +148,35 @@ For an Ollama-style request without `num_predict` or `max_tokens`, the proxy
 uses an `8192`-token output limit. Set an explicit limit in client requests
 when a different cap is required.
 
-## Performance profile
+## Performance profiles
 
-The defaults target single-chat throughput on a 12 GB NVIDIA GPU and use:
+`start.bat` and `start.bat start` use the `fast` profile, intended for a
+small enough GGUF that can keep its active KV cache in VRAM. It uses:
 
 - `--no-mmap` to load model data into RAM.
-- `--n-gpu-layers auto`, `--fit on`, and `--fit-target 512` for GPU offload.
-- `--flash-attn auto` and `--kv-offload on`.
-- `q8_0` key/value cache.
-- Context fallback from `262144` down to `8192` tokens.
+- `--n-gpu-layers 999`, `--fit on`, and `--fit-target 512` to request the
+  maximum viable GPU layer offload.
+- GPU KV cache in `q4_0` with context fallback from `65536` to `8192` tokens.
+- `--reasoning off` so models with optional thinking do not spend the visible
+  response budget on a reasoning trace.
+
+`start.bat start --long` uses the `long` profile for larger GGUFs and long
+prompts. It keeps the `q8_0` KV cache in host RAM, requests maximum viable
+layer offload with a `2048` MiB fit target, and falls back from `262144` to
+`8192` context tokens. This preserves VRAM for model layers at the cost of
+lower token generation throughput.
+
+Both profiles use:
+
+- Flash attention when supported.
 - `threads = 8`, `threads-batch = 8`, `batch-size = 2048`, and
   `ubatch-size = 512`.
 
 The best values depend on model size, quantization, GPU VRAM, system RAM, CUDA
-driver, and concurrent requests. Use `start.bat bench` after changing
-`config/models.preset.ini`, and leave enough VRAM headroom for stable loading.
+driver, and concurrent requests. `compare` writes raw response and timing
+records to `logs/model-comparison/results.jsonl`; `longtest` does the same in
+`logs/full-context/results.jsonl`. Long tests use a multi-hour request timeout
+and can be resumed after interruption.
 
 ## Logging and privacy
 
