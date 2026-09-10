@@ -16,8 +16,8 @@ credential is part of this repository.
 - Ollama-compatible API and OpenAI forwarding on port `11434`.
 - Model selection via the API `model` field or `start.bat switch <fragment>`.
 - Automatic context fallback if the requested RAM/VRAM allocation cannot load.
-- CUDA auto-offload, Flash Attention, KV-cache offload, RAM loading, and
-  performance-oriented defaults.
+- Deterministic CUDA full-offload, Flash Attention, GPU KV cache, RAM loading,
+  and performance-oriented defaults.
 - Detailed request diagnostics without storing full prompts or responses.
 - Optional firewall rules restricted to the Windows Private profile and
   `LocalSubnet`.
@@ -87,6 +87,7 @@ start.bat bench           Run a small direct OpenAI API benchmark
 start.bat compare         Compare all installed GGUF models and save responses/timings
 start.bat longtest        Run 64K, 128K, and 262K synthetic context tests
 start.bat longtest --resume  Continue completed long-context work without repetition
+start.bat watch-mtp       Wait for the verified MTP draft, then restart the fast server with it
 start.bat downloads       List local files in downloads
 start.bat firewall        Add Private/LocalSubnet firewall rules using UAC
 ```
@@ -154,11 +155,23 @@ when a different cap is required.
 small enough GGUF that can keep its active KV cache in VRAM. It uses:
 
 - `--no-mmap` to load model data into RAM.
-- `--n-gpu-layers 999`, `--fit on`, and `--fit-target 512` to request the
-  maximum viable GPU layer offload.
-- GPU KV cache in `q4_0` with context fallback from `65536` to `8192` tokens.
+- Fixed `--n-gpu-layers 999` and `--fit off`. This avoids combining a fixed
+  offload count with automatic fitting, which makes memory placement
+  non-deterministic.
+- `--no-host`, GPU KV cache in `q4_0`, and a context fallback from `32768` to
+  `8192` tokens. The process fails rather than quietly putting GPU buffers in
+  system RAM.
+- `--flash-attn on`, two generation threads, eight prompt-processing threads,
+  `batch-size = 2048`, and `ubatch-size = 512`.
 - `--reasoning off` so models with optional thinking do not spend the visible
   response budget on a reasoning trace.
+
+When the official compatible `mtp-Qwen3.8-27B-Q4_0.gguf` is complete in the
+`models` directory, the fast profile automatically enables Qwen's MTP
+speculative decoding for the `LowGPU` Qwen model. An incomplete aria2 download
+is never selected as a draft model; activation also requires its documented
+size and SHA-256 digest. The draft file is excluded from the Ollama-style model
+list because it is an accelerator, not a chat model.
 
 `start.bat start --long` uses the `long` profile for larger GGUFs and long
 prompts. It keeps the `q8_0` KV cache in host RAM, requests maximum viable
@@ -169,14 +182,20 @@ lower token generation throughput.
 Both profiles use:
 
 - Flash attention when supported.
-- `threads = 8`, `threads-batch = 8`, `batch-size = 2048`, and
-  `ubatch-size = 512`.
+- A single generation slot. Increase `parallel` only for concurrent users;
+  it improves aggregate throughput but reduces single-chat latency.
 
 The best values depend on model size, quantization, GPU VRAM, system RAM, CUDA
 driver, and concurrent requests. `compare` writes raw response and timing
 records to `logs/model-comparison/results.jsonl`; `longtest` does the same in
 `logs/full-context/results.jsonl`. Long tests use a multi-hour request timeout
 and can be resumed after interruption.
+
+`start.bat bench` requests 512 generated tokens and prints the end-to-end
+token rate. For model-internal decode speed, inspect the corresponding
+`eval time` line in `logs/llama-server.out.log`. GPU power is workload
+dependent: prompt prefill usually saturates GPU compute, while ordinary
+autoregressive decoding is primarily memory-bandwidth-bound.
 
 ## Logging and privacy
 

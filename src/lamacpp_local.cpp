@@ -5,9 +5,11 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
+#include <bcrypt.h>
 #include <shellapi.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
@@ -27,6 +29,9 @@
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "advapi32.lib")
+#pragma comment(lib, "bcrypt.lib")
+
+#include <tlhelp32.h>
 
 namespace fs = std::filesystem;
 
@@ -42,6 +47,9 @@ struct Settings {
     int fit_target_mib = 512;
     int batch_size = 2048;
     int ubatch_size = 512;
+    int gpu_layers = -1;
+    bool fit = true;
+    bool no_host = false;
     bool kv_offload = false;
     std::string cache_type_k = "q8_0";
     std::string cache_type_v = "q8_0";
@@ -51,8 +59,13 @@ struct Settings {
 static Settings settings_for_profile(const std::string & profile) {
     Settings s;
     if (profile == "fast") {
-        s.contexts = {65536, 49152, 32768, 16384, 8192};
+        s.contexts = {32768, 16384, 8192};
+        s.threads = 2;
+        s.threads_batch = 8;
         s.fit_target_mib = 512;
+        s.gpu_layers = 999;
+        s.fit = false;
+        s.no_host = true;
         s.kv_offload = true;
         s.cache_type_k = "q4_0";
         s.cache_type_v = "q4_0";
@@ -212,19 +225,72 @@ static bool process_alive(int pid) {
     return alive;
 }
 
+static void terminate_process_tree(DWORD pid) {
+    if (!pid) return;
+
+    std::vector<DWORD> children;
+    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snapshot != INVALID_HANDLE_VALUE) {
+        PROCESSENTRY32 entry{};
+        entry.dwSize = sizeof(entry);
+        if (Process32First(snapshot, &entry)) {
+            do {
+                if (entry.th32ParentProcessID == pid) children.push_back(entry.th32ProcessID);
+            } while (Process32Next(snapshot, &entry));
+        }
+        CloseHandle(snapshot);
+    }
+    for (DWORD child : children) terminate_process_tree(child);
+
+    HANDLE h = OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, FALSE, pid);
+    if (!h) return;
+    TerminateProcess(h, 0);
+    WaitForSingleObject(h, 5000);
+    CloseHandle(h);
+}
+
+static bool is_our_llama_server(DWORD pid) {
+    HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!process) return false;
+    std::array<char, 32768> image{};
+    DWORD length = static_cast<DWORD>(image.size());
+    bool ok = QueryFullProcessImageNameA(process, 0, image.data(), &length) != FALSE;
+    CloseHandle(process);
+    if (!ok) return false;
+    std::error_code ec;
+    fs::path expected = fs::weakly_canonical(path_in_root("bin/llama-server.exe"), ec);
+    fs::path actual = fs::weakly_canonical(fs::path(std::string(image.data(), length)), ec);
+    return lower(expected.string()) == lower(actual.string());
+}
+
+static void stop_orphaned_llama_servers() {
+    std::vector<DWORD> owned;
+    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snapshot == INVALID_HANDLE_VALUE) return;
+    PROCESSENTRY32 entry{};
+    entry.dwSize = sizeof(entry);
+    if (Process32First(snapshot, &entry)) {
+        do {
+            if (_stricmp(entry.szExeFile, "llama-server.exe") == 0 && is_our_llama_server(entry.th32ProcessID)) {
+                owned.push_back(entry.th32ProcessID);
+            }
+        } while (Process32Next(snapshot, &entry));
+    }
+    CloseHandle(snapshot);
+    for (DWORD owned_pid : owned) terminate_process_tree(owned_pid);
+}
+
 static void stop_pid_file(const fs::path & p, const std::string & name) {
     auto pid = read_pid(p);
     if (!pid || !process_alive(*pid)) {
         std::cout << name << " is not running\n";
+        if (name == "llama-server") stop_orphaned_llama_servers();
         std::error_code ec;
         fs::remove(p, ec);
         return;
     }
-    HANDLE h = OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, FALSE, DWORD(*pid));
-    if (!h) throw std::runtime_error("cannot open process " + std::to_string(*pid));
-    TerminateProcess(h, 0);
-    WaitForSingleObject(h, 5000);
-    CloseHandle(h);
+    terminate_process_tree(DWORD(*pid));
+    if (name == "llama-server") stop_orphaned_llama_servers();
     std::error_code ec;
     fs::remove(p, ec);
     std::cout << "stopped " << name << " pid " << *pid << "\n";
@@ -542,12 +608,70 @@ static std::string http_reply(int status, const std::string & content_type, cons
     return out.str();
 }
 
+static bool is_draft_gguf(const fs::path & path) {
+    std::string name = lower(path.filename().string());
+    return name.rfind("mtp-", 0) == 0 || name.find("-draft") != std::string::npos;
+}
+
+static std::string sha256_file(const fs::path & file) {
+    BCRYPT_ALG_HANDLE algorithm = nullptr;
+    BCRYPT_HASH_HANDLE hash = nullptr;
+    DWORD object_size = 0, hash_size = 0, size = 0;
+    if (BCryptOpenAlgorithmProvider(&algorithm, BCRYPT_SHA256_ALGORITHM, nullptr, 0) < 0) return {};
+    auto close_algorithm = [&]() { if (algorithm) BCryptCloseAlgorithmProvider(algorithm, 0); };
+    if (BCryptGetProperty(algorithm, BCRYPT_OBJECT_LENGTH, reinterpret_cast<PUCHAR>(&object_size), sizeof(object_size), &size, 0) < 0 ||
+        BCryptGetProperty(algorithm, BCRYPT_HASH_LENGTH, reinterpret_cast<PUCHAR>(&hash_size), sizeof(hash_size), &size, 0) < 0) {
+        close_algorithm();
+        return {};
+    }
+
+    std::vector<UCHAR> object(object_size), digest(hash_size), buffer(1024 * 1024);
+    if (BCryptCreateHash(algorithm, &hash, object.data(), object_size, nullptr, 0, 0) < 0) {
+        close_algorithm();
+        return {};
+    }
+    std::ifstream input(file, std::ios::binary);
+    while (input) {
+        input.read(reinterpret_cast<char *>(buffer.data()), static_cast<std::streamsize>(buffer.size()));
+        std::streamsize read = input.gcount();
+        if (read > 0 && BCryptHashData(hash, buffer.data(), static_cast<ULONG>(read), 0) < 0) {
+            BCryptDestroyHash(hash);
+            close_algorithm();
+            return {};
+        }
+    }
+    bool ok = input.eof() && BCryptFinishHash(hash, digest.data(), hash_size, 0) >= 0;
+    BCryptDestroyHash(hash);
+    close_algorithm();
+    if (!ok) return {};
+
+    static constexpr char hex[] = "0123456789abcdef";
+    std::string result;
+    result.reserve(digest.size() * 2);
+    for (UCHAR byte : digest) {
+        result.push_back(hex[byte >> 4]);
+        result.push_back(hex[byte & 0x0f]);
+    }
+    return result;
+}
+
+static std::optional<fs::path> qwen_mtp_draft() {
+    fs::path draft = path_in_root("models/mtp-Qwen3.8-27B-Q4_0.gguf");
+    constexpr uintmax_t expected_size = 1680271648;
+    constexpr const char * expected_sha256 = "051a1764cff8c4f3ee6ae8b00593a0364c7539c67fa50ffc58f3f96509fca38e";
+    std::error_code ec;
+    fs::path progress = draft.string() + ".aria2";
+    if (fs::is_regular_file(draft, ec) && !fs::exists(progress, ec) && fs::file_size(draft, ec) == expected_size &&
+        sha256_file(draft) == expected_sha256) return draft;
+    return std::nullopt;
+}
+
 static std::vector<fs::path> gguf_files() {
     std::vector<fs::path> out;
     fs::path dir = path_in_root("models");
     if (!fs::exists(dir)) return out;
     for (const auto & e : fs::recursive_directory_iterator(dir)) {
-        if (e.is_regular_file() && lower(e.path().extension().string()) == ".gguf") out.push_back(e.path());
+        if (e.is_regular_file() && lower(e.path().extension().string()) == ".gguf" && !is_draft_gguf(e.path())) out.push_back(e.path());
     }
     std::sort(out.begin(), out.end());
     return out;
@@ -613,10 +737,11 @@ static void write_preset(int ctx, const Settings & s) {
     out << "version = 1\n\n";
     out << "[*]\n";
     out << "c = " << ctx << "\n";
-    out << "n-gpu-layers = 999\n";
-    out << "fit = on\n";
+    if (s.gpu_layers >= 0) out << "n-gpu-layers = " << s.gpu_layers << "\n";
+    out << "fit = " << (s.fit ? "on" : "off") << "\n";
     out << "fit-target = " << s.fit_target_mib << "\n";
-    out << "flash-attn = auto\n";
+    out << "flash-attn = on\n";
+    if (s.no_host) out << "no-host = true\n";
     out << "kv-offload = " << (s.kv_offload ? "true" : "false") << "\n";
     out << "cache-type-k = " << s.cache_type_k << "\n";
     out << "cache-type-v = " << s.cache_type_v << "\n";
@@ -627,6 +752,25 @@ static void write_preset(int ctx, const Settings & s) {
     out << "jinja = true\n";
     out << "batch-size = " << s.batch_size << "\n";
     out << "ubatch-size = " << s.ubatch_size << "\n";
+
+    if (s.profile == "fast") {
+        auto draft = qwen_mtp_draft();
+        if (draft) {
+            for (const auto & model : gguf_files()) {
+                if (lower(model.filename().string()).find("lowgpu") == std::string::npos) continue;
+                out << "\n[" << model.stem().string() << "]\n";
+                out << "model-draft = " << draft->string() << "\n";
+                out << "spec-type = draft-mtp\n";
+                out << "spec-draft-ngl = 999\n";
+                out << "spec-draft-device = " << preferred_device() << "\n";
+                out << "spec-draft-n-max = 3\n";
+                out << "spec-draft-type-k = q4_0\n";
+                out << "spec-draft-type-v = q4_0\n";
+                out << "spec-draft-threads = 2\n";
+                out << "spec-draft-threads-batch = 8\n";
+            }
+        }
+    }
     write_file(path_in_root("config/models.preset.ini"), out.str());
 }
 
@@ -1172,6 +1316,27 @@ static int cmd_start(bool no_proxy, bool no_preload, const std::string & profile
     throw std::runtime_error("unable to start llama-server with configured contexts");
 }
 
+static int cmd_bench(const std::string & prompt);
+
+static int cmd_watch_mtp() {
+    SetConsoleCtrlHandler(console_handler, TRUE);
+    fs::create_directories(path_in_root("state"));
+    fs::path pid_file = path_in_root("state/mtp-watch.pid");
+    write_file(pid_file, std::to_string(GetCurrentProcessId()) + "\n");
+    std::cout << "waiting for verified Qwen MTP draft...\n";
+    while (!g_stop_requested && !qwen_mtp_draft()) {
+        std::this_thread::sleep_for(std::chrono::seconds(15));
+    }
+    std::error_code ec;
+    fs::remove(pid_file, ec);
+    if (g_stop_requested) return 0;
+
+    std::cout << "verified Qwen MTP draft; restarting the fast server\n";
+    int rc = cmd_start(false, false, "fast");
+    if (rc != 0) return rc;
+    return cmd_bench("Schreibe mindestens 450 zusammenhaengende deutsche Woerter ueber nachhaltige Staedte. Kein Titel und keine Liste.");
+}
+
 static std::string one_line(std::string s, size_t limit = 500) {
     for (char & c : s) {
         if (c == '\r' || c == '\n' || c == '\t') c = ' ';
@@ -1251,7 +1416,8 @@ static int cmd_run(bool exit_after_tests, const std::string & profile) {
     std::cout << " Backend: " << backend_name() << "  Preferred device: " << (preferred_device().empty() ? "CPU" : preferred_device()) << "\n";
     std::cout << " Model:   " << default_model() << "\n";
     std::cout << " Profile: " << s.profile << "  KV: " << (s.kv_offload ? "GPU " + s.cache_type_k : "RAM " + s.cache_type_k) << "\n";
-    std::cout << " RAM mode: --no-mmap (model is loaded into RAM), VRAM mode: --fit + GPU offload\n";
+    std::cout << " RAM mode: --no-mmap (model is loaded into RAM), VRAM mode: "
+              << (s.no_host ? "strict GPU buffers without host fallback" : "automatic fit + GPU offload") << "\n";
     std::cout << " APIs:    OpenAI http://127.0.0.1:8080/v1  |  Ollama http://127.0.0.1:11434/api\n";
     std::cout << "============================================================\n";
     print_devices();
@@ -1271,7 +1437,7 @@ static int cmd_run(bool exit_after_tests, const std::string & profile) {
 
         if (!wait_health(180)) {
             std::cerr << "[START] Server did not become healthy at ctx " << ctx << "\n";
-            TerminateProcess(pi.hProcess, 1);
+            terminate_process_tree(pi.dwProcessId);
             WaitForSingleObject(pi.hProcess, 15000);
             CloseHandle(pi.hThread);
             CloseHandle(pi.hProcess);
@@ -1280,7 +1446,7 @@ static int cmd_run(bool exit_after_tests, const std::string & profile) {
         std::cout << "[START] Server is healthy. Loading model into RAM/VRAM...\n";
         if (!preload_model(default_model())) {
             std::cerr << "[START] Model preload failed at ctx " << ctx << ", trying lower context.\n";
-            TerminateProcess(pi.hProcess, 1);
+            terminate_process_tree(pi.dwProcessId);
             WaitForSingleObject(pi.hProcess, 15000);
             CloseHandle(pi.hThread);
             CloseHandle(pi.hProcess);
@@ -1317,7 +1483,7 @@ static int cmd_run(bool exit_after_tests, const std::string & profile) {
     std::cout << "============================================================\n";
 
     if (exit_after_tests) {
-        TerminateProcess(pi.hProcess, 0);
+        terminate_process_tree(pi.dwProcessId);
         WaitForSingleObject(pi.hProcess, 15000);
         CloseHandle(pi.hThread);
         CloseHandle(pi.hProcess);
@@ -1332,7 +1498,7 @@ static int cmd_run(bool exit_after_tests, const std::string & profile) {
         if (!GetExitCodeProcess(pi.hProcess, &code) || code != STILL_ACTIVE) break;
         std::this_thread::sleep_for(std::chrono::seconds(1));
     }
-    TerminateProcess(pi.hProcess, 0);
+    terminate_process_tree(pi.dwProcessId);
     WaitForSingleObject(pi.hProcess, 15000);
     CloseHandle(pi.hThread);
     CloseHandle(pi.hProcess);
@@ -1343,6 +1509,7 @@ static int cmd_run(bool exit_after_tests, const std::string & profile) {
 }
 
 static int cmd_stop() {
+    stop_pid_file(path_in_root("state/mtp-watch.pid"), "mtp-watch");
     stop_pid_file(path_in_root("state/ollama-proxy.pid"), "ollama-proxy");
     stop_pid_file(path_in_root("state/llama-server.pid"), "llama-server");
     return 0;
@@ -1352,9 +1519,11 @@ static int cmd_status() {
     WinsockInit wsa;
     auto lp = read_pid(path_in_root("state/llama-server.pid"));
     auto pp = read_pid(path_in_root("state/ollama-proxy.pid"));
+    auto mp = read_pid(path_in_root("state/mtp-watch.pid"));
     std::cout << "root: " << root_dir().string() << "\n";
     std::cout << "llama-server pid: " << (lp ? std::to_string(*lp) : "-") << " alive=" << (lp && process_alive(*lp) ? "yes" : "no") << "\n";
     std::cout << "ollama-proxy pid: " << (pp ? std::to_string(*pp) : "-") << " alive=" << (pp && process_alive(*pp) ? "yes" : "no") << "\n";
+    std::cout << "mtp-watch pid: " << (mp ? std::to_string(*mp) : "-") << " alive=" << (mp && process_alive(*mp) ? "yes" : "no") << "\n";
     std::cout << "default model: " << default_model() << "\n";
     std::cout << "models:\n";
     for (const auto & p : gguf_files()) std::cout << "  " << p.filename().string() << " (" << fs::file_size(p) << " bytes)\n";
@@ -1459,12 +1628,7 @@ static int count_words(const std::string & value) {
 }
 
 static void terminate_process(DWORD pid) {
-    if (!pid) return;
-    HANDLE h = OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, FALSE, pid);
-    if (!h) return;
-    TerminateProcess(h, 0);
-    WaitForSingleObject(h, 30000);
-    CloseHandle(h);
+    terminate_process_tree(pid);
 }
 
 static bool wait_health_on_port(int port, int seconds) {
@@ -1488,13 +1652,10 @@ static std::string build_compare_server_command(const fs::path & model, int port
         << " --host 127.0.0.1"
         << " --port " << port
         << " --ctx-size " << profile.context
-        << " --n-gpu-layers 999"
-        << " --fit on"
-        << " --fit-target " << profile.fit_target_mib
         << " --flash-attn on"
         << " --cache-type-k " << profile.cache_type
         << " --cache-type-v " << profile.cache_type
-        << " --threads 8"
+        << " --threads " << (profile.gpu_kv ? 2 : 8)
         << " --threads-batch 8"
         << " --parallel 1"
         << " --batch-size 2048"
@@ -1504,8 +1665,11 @@ static std::string build_compare_server_command(const fs::path & model, int port
         << " --no-mmap"
         << " --jinja"
         << " --reasoning off";
-    if (profile.gpu_kv) cmd << " --kv-offload";
-    else cmd << " --no-kv-offload";
+    if (profile.gpu_kv) {
+        cmd << " --n-gpu-layers 999 --fit off --no-host --kv-offload";
+    } else {
+        cmd << " --fit on --fit-target " << profile.fit_target_mib << " --no-kv-offload";
+    }
     std::string dev = preferred_device();
     if (!dev.empty()) cmd << " --device " << dev;
     return cmd.str();
@@ -1652,7 +1816,7 @@ static int cmd_compare(const std::string & fragment, bool resume) {
         if (!model_matches(model, fragment)) continue;
         ++tested;
         if (lower(model.filename().string()).find("lowgpu") != std::string::npos) {
-            CompareProfile fast_profile{"fast_gpu_kv_q4", 65536, 512, true, "q4_0"};
+            CompareProfile fast_profile{"fast_gpu_kv_q4", 32768, 512, true, "q4_0"};
             failures += run_model_server_cases(model, fast_profile, {cases.front()}, result_file, resume, 18080);
         }
         CompareProfile profile{"standard_host_kv_q8", 65536, compare_fit_target(model), false, "q8_0"};
@@ -1691,7 +1855,7 @@ static int cmd_bench(const std::string & prompt) {
     WinsockInit wsa;
     std::string model = default_model();
     if (model.empty()) throw std::runtime_error("no default model");
-    std::string body = "{\"model\":\"" + json_escape(model) + "\",\"messages\":[{\"role\":\"user\",\"content\":\"" + json_escape(prompt) + "\"}],\"max_tokens\":128,\"stream\":false}";
+    std::string body = "{\"model\":\"" + json_escape(model) + "\",\"messages\":[{\"role\":\"user\",\"content\":\"" + json_escape(prompt) + "\"}],\"max_tokens\":512,\"stream\":false}";
     auto t0 = std::chrono::steady_clock::now();
     auto r = http_request("127.0.0.1", 8080, "POST", "/v1/chat/completions", body, {{"Content-Type", "application/json"}});
     auto t1 = std::chrono::steady_clock::now();
@@ -1728,6 +1892,7 @@ static void usage() {
         "  bench [prompt]\n"
         "  compare [--model <fragment>] [--resume]\n"
         "  longtest [--model <fragment>] [--resume]\n"
+        "  watch-mtp\n"
         "  proxy\n"
         "  downloads\n"
         "  firewall\n";
@@ -1769,6 +1934,7 @@ int main(int argc, char ** argv) {
         }
         if (cmd == "stop") return cmd_stop();
         if (cmd == "status") return cmd_status();
+        if (cmd == "watch-mtp") return cmd_watch_mtp();
         if (cmd == "firewall") {
             bool elevated_child = false;
             for (int i = 2; i < argc; ++i) if (lower(argv[i]) == "--elevated") elevated_child = true;
