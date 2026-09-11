@@ -19,6 +19,7 @@
 # Runtime data and diagnostics
 /logs/
 /state/
+/config/models.preset.ini
 *.log
 *.pid
 

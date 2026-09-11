@@ -14,6 +14,9 @@ if /I "%CMD%"=="status" goto direct
 if /I "%CMD%"=="switch" goto direct
 if /I "%CMD%"=="bench" goto direct
 if /I "%CMD%"=="compare" goto direct
+if /I "%CMD%"=="tune" goto direct
+if /I "%CMD%"=="mtptune" goto direct
+if /I "%CMD%"=="contextprobe" goto direct
 if /I "%CMD%"=="longtest" goto direct
 if /I "%CMD%"=="watch-mtp" goto direct
 if /I "%CMD%"=="proxy" goto direct

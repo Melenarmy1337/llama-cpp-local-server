@@ -16,8 +16,8 @@ credential is part of this repository.
 - Ollama-compatible API and OpenAI forwarding on port `11434`.
 - Model selection via the API `model` field or `start.bat switch <fragment>`.
 - Automatic context fallback if the requested RAM/VRAM allocation cannot load.
-- Deterministic CUDA full-offload, Flash Attention, GPU KV cache, RAM loading,
-  and performance-oriented defaults.
+- Automatic CUDA offload, Flash Attention, GPU KV cache, RAM loading, and
+  performance-oriented defaults.
 - Detailed request diagnostics without storing full prompts or responses.
 - Optional firewall rules restricted to the Windows Private profile and
   `LocalSubnet`.
@@ -77,14 +77,20 @@ performs API smoke tests, then keeps the server alive. Stop it with `Ctrl+C`.
 
 ```bat
 start.bat                 Run the fast profile in the foreground, including self-tests
+start.bat --balanced      Run the 32K balanced profile in the foreground
 start.bat --long          Run the long-context profile in the foreground
 start.bat start           Start the fast profile in the background
+start.bat start --balanced Start the 32K balanced profile in the background
 start.bat start --long    Start the long-context profile in the background
 start.bat stop            Stop both background processes
 start.bat status          Show process, model, firewall, and API status
 start.bat switch Qwen     Select the first GGUF whose name contains Qwen
 start.bat bench           Run a small direct OpenAI API benchmark
 start.bat compare         Compare all installed GGUF models and save responses/timings
+start.bat tune            Test automatic GPU offload, thread counts, and 8K-64K contexts per GGUF
+start.bat tune --resume   Continue an interrupted tuning matrix without repeating completed cases
+start.bat mtptune         Tune MTP draft length and confidence for natural German text
+start.bat contextprobe    Test the active 8K and 32K input contexts for the default model
 start.bat longtest        Run 64K, 128K, and 262K synthetic context tests
 start.bat longtest --resume  Continue completed long-context work without repetition
 start.bat watch-mtp       Wait for the verified MTP draft, then restart the fast server with it
@@ -155,16 +161,17 @@ when a different cap is required.
 small enough GGUF that can keep its active KV cache in VRAM. It uses:
 
 - `--no-mmap` to load model data into RAM.
-- Fixed `--n-gpu-layers 999` and `--fit off`. This avoids combining a fixed
-  offload count with automatic fitting, which makes memory placement
-  non-deterministic.
-- `--no-host`, GPU KV cache in `q4_0`, and a context fallback from `32768` to
-  `8192` tokens. The process fails rather than quietly putting GPU buffers in
-  system RAM.
-- `--flash-attn on`, two generation threads, eight prompt-processing threads,
+- Automatic maximum layer offload with a `512` MiB free-VRAM target, GPU KV
+  cache in `q4_0`, and an `8192` token context.
+- `--flash-attn on`, sixteen generation and prompt-processing threads,
   `batch-size = 2048`, and `ubatch-size = 512`.
 - `--reasoning off` so models with optional thinking do not spend the visible
   response budget on a reasoning trace.
+
+`start.bat --balanced` and `start.bat start --balanced` use the same GPU-first
+configuration with `32768`, `16384`, then `8192` context fallback. It is for
+chats that need more than 8K context; the larger GPU KV cache reduces
+single-user generation speed compared with the fast profile.
 
 When the official compatible `mtp-Qwen3.8-27B-Q4_0.gguf` is complete in the
 `models` directory, the fast profile automatically enables Qwen's MTP
@@ -172,6 +179,11 @@ speculative decoding for the `LowGPU` Qwen model. An incomplete aria2 download
 is never selected as a draft model; activation also requires its documented
 size and SHA-256 digest. The draft file is excluded from the Ollama-style model
 list because it is an accelerator, not a chat model.
+
+The production MTP profile uses a draft length of two tokens. The included
+`mtptune` command measures that value against longer drafts using natural German
+text, because the highest accepted draft length for repetitive benchmark output
+is not necessarily the fastest setting for normal responses.
 
 `start.bat start --long` uses the `long` profile for larger GGUFs and long
 prompts. It keeps the `q8_0` KV cache in host RAM, requests maximum viable
@@ -196,6 +208,26 @@ token rate. For model-internal decode speed, inspect the corresponding
 `eval time` line in `logs/llama-server.out.log`. GPU power is workload
 dependent: prompt prefill usually saturates GPU compute, while ordinary
 autoregressive decoding is primarily memory-bandwidth-bound.
+
+`start.bat tune` temporarily stops the public server because each direct test
+requires exclusive VRAM. It evaluates every installed chat GGUF with automatic
+maximum offload, 8/16/32 CPU threads, GPU `q4_0` KV, and 8K/32K/64K context
+allocations. Each result contains output tokens per second, timings, and failures in
+`logs/performance-tuning/results.jsonl`; the public APIs are restored at the
+end. The command intentionally does not claim that a model too large for VRAM
+can match the throughput of a fully offloaded model.
+
+`start.bat contextprobe` is the short active-context validation for the default
+model. It sends synthetic 8K and 32K context prompts, asks for a 64-token
+verification response, and records token counts and end-to-end timings in
+`logs/context-probe/results.jsonl`. Unlike `longtest`, it is not intended as a
+multi-hour stress run. Results record both completion-only and end-to-end token
+rates, so a short verification answer does not hide prompt-processing speed.
+
+`start.bat mtptune` benchmarks the verified Qwen MTP draft with multiple draft
+lengths and a confidence threshold against a fixed natural-language prompt.
+It records each trial in `logs/mtp-tuning/results.jsonl` and restores the fast
+API profile when it completes.
 
 ## Logging and privacy
 

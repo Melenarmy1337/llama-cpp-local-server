@@ -59,17 +59,25 @@ struct Settings {
 static Settings settings_for_profile(const std::string & profile) {
     Settings s;
     if (profile == "fast") {
-        s.contexts = {32768, 16384, 8192};
-        s.threads = 2;
-        s.threads_batch = 8;
+        s.contexts = {8192};
+        s.threads = 16;
+        s.threads_batch = 16;
         s.fit_target_mib = 512;
-        s.gpu_layers = 999;
-        s.fit = false;
-        s.no_host = true;
+        s.fit = true;
+        s.no_host = false;
         s.kv_offload = true;
         s.cache_type_k = "q4_0";
         s.cache_type_v = "q4_0";
         s.profile = "fast";
+    } else if (profile == "balanced") {
+        s.contexts = {32768, 16384, 8192};
+        s.threads = 16;
+        s.threads_batch = 16;
+        s.fit_target_mib = 512;
+        s.kv_offload = true;
+        s.cache_type_k = "q4_0";
+        s.cache_type_v = "q4_0";
+        s.profile = "balanced";
     } else if (profile == "long") {
         s.fit_target_mib = 2048;
         s.kv_offload = false;
@@ -763,7 +771,7 @@ static void write_preset(int ctx, const Settings & s) {
                 out << "spec-type = draft-mtp\n";
                 out << "spec-draft-ngl = 999\n";
                 out << "spec-draft-device = " << preferred_device() << "\n";
-                out << "spec-draft-n-max = 3\n";
+                out << "spec-draft-n-max = 2\n";
                 out << "spec-draft-type-k = q4_0\n";
                 out << "spec-draft-type-v = q4_0\n";
                 out << "spec-draft-threads = 2\n";
@@ -1587,6 +1595,12 @@ struct CompareProfile {
     int fit_target_mib = 2048;
     bool gpu_kv = false;
     std::string cache_type = "q8_0";
+    int threads = 8;
+    int threads_batch = 8;
+    bool strict_gpu = false;
+    bool enable_mtp = true;
+    int mtp_draft_n_max = 3;
+    double mtp_draft_p_min = 0.0;
 };
 
 struct CompareResult {
@@ -1598,6 +1612,8 @@ struct CompareResult {
     double elapsed_seconds = 0.0;
     int prompt_tokens = 0;
     int completion_tokens = 0;
+    double completion_tokens_per_second = 0.0;
+    double end_to_end_tokens_per_second = 0.0;
     int output_words = 0;
     std::string finish_reason;
     std::string status;
@@ -1655,8 +1671,8 @@ static std::string build_compare_server_command(const fs::path & model, int port
         << " --flash-attn on"
         << " --cache-type-k " << profile.cache_type
         << " --cache-type-v " << profile.cache_type
-        << " --threads " << (profile.gpu_kv ? 2 : 8)
-        << " --threads-batch 8"
+        << " --threads " << profile.threads
+        << " --threads-batch " << profile.threads_batch
         << " --parallel 1"
         << " --batch-size 2048"
         << " --ubatch-size 512"
@@ -1665,10 +1681,24 @@ static std::string build_compare_server_command(const fs::path & model, int port
         << " --no-mmap"
         << " --jinja"
         << " --reasoning off";
-    if (profile.gpu_kv) {
+    if (profile.strict_gpu) {
         cmd << " --n-gpu-layers 999 --fit off --no-host --kv-offload";
     } else {
-        cmd << " --fit on --fit-target " << profile.fit_target_mib << " --no-kv-offload";
+        cmd << " --fit on --fit-target " << profile.fit_target_mib;
+        cmd << (profile.gpu_kv ? " --kv-offload" : " --no-kv-offload");
+    }
+    if (profile.enable_mtp && lower(model.filename().string()).find("lowgpu") != std::string::npos) {
+        if (auto draft = qwen_mtp_draft()) {
+            cmd << " --model-draft " << quote_arg(draft->string())
+                << " --spec-type draft-mtp --n-gpu-layers-draft 999"
+                << " --device-draft " << preferred_device()
+                << " --spec-draft-n-max " << profile.mtp_draft_n_max
+                << " --cache-type-k-draft q4_0 --cache-type-v-draft q4_0"
+                << " --threads-draft 2 --threads-batch-draft 8";
+            if (profile.mtp_draft_p_min > 0.0) {
+                cmd << " --spec-draft-p-min " << profile.mtp_draft_p_min;
+            }
+        }
     }
     std::string dev = preferred_device();
     if (!dev.empty()) cmd << " --device " << dev;
@@ -1687,6 +1717,8 @@ static void append_compare_result(const fs::path & file, const CompareResult & r
         << ",\"elapsed_seconds\":" << result.elapsed_seconds
         << ",\"prompt_tokens\":" << result.prompt_tokens
         << ",\"completion_tokens\":" << result.completion_tokens
+        << ",\"completion_tokens_per_second\":" << result.completion_tokens_per_second
+        << ",\"end_to_end_tokens_per_second\":" << result.end_to_end_tokens_per_second
         << ",\"output_words\":" << result.output_words
         << ",\"finish_reason\":\"" << json_escape(result.finish_reason) << "\""
         << ",\"response\":\"" << json_escape(result.response) << "\""
@@ -1727,6 +1759,10 @@ static CompareResult run_compare_request(int port, const fs::path & model, const
         result.response = openai_content_from_response(response.body);
         result.prompt_tokens = openai_token_count(response.body, "prompt_tokens");
         result.completion_tokens = openai_token_count(response.body, "completion_tokens");
+        if (result.elapsed_seconds > 0.0) {
+            result.completion_tokens_per_second = result.completion_tokens / result.elapsed_seconds;
+            result.end_to_end_tokens_per_second = (result.prompt_tokens + result.completion_tokens) / result.elapsed_seconds;
+        }
         result.output_words = count_words(result.response);
         result.finish_reason = openai_finish_reason(response.body);
         result.status = response.status >= 200 && response.status < 300 ? "ok" : "http_error";
@@ -1793,6 +1829,7 @@ static int run_model_server_cases(const fs::path & model, const CompareProfile &
         append_compare_result(result_file, result);
         std::cout << "  " << item.first << " status=" << result.status << " http=" << result.http_status
                   << " elapsed=" << result.elapsed_seconds << "s output=" << result.completion_tokens << " tok"
+                  << " rate=" << result.completion_tokens_per_second << " tok/s"
                   << " words=" << result.output_words << " finish=" << result.finish_reason << "\n";
         if (result.status != "ok") ++failures;
     }
@@ -1816,7 +1853,7 @@ static int cmd_compare(const std::string & fragment, bool resume) {
         if (!model_matches(model, fragment)) continue;
         ++tested;
         if (lower(model.filename().string()).find("lowgpu") != std::string::npos) {
-            CompareProfile fast_profile{"fast_gpu_kv_q4", 32768, 512, true, "q4_0"};
+            CompareProfile fast_profile{"fast_gpu_kv_q4", 32768, 512, true, "q4_0", 2, 8, true};
             failures += run_model_server_cases(model, fast_profile, {cases.front()}, result_file, resume, 18080);
         }
         CompareProfile profile{"standard_host_kv_q8", 65536, compare_fit_target(model), false, "q8_0"};
@@ -1825,6 +1862,129 @@ static int cmd_compare(const std::string & fragment, bool resume) {
     if (!tested) throw std::runtime_error("no model matches '" + fragment + "'");
     std::cout << "comparison results: " << result_file.string() << "\n";
     return failures ? 2 : 0;
+}
+
+static void start_mtp_watcher_if_needed() {
+    if (qwen_mtp_draft()) return;
+    fs::path pid_file = path_in_root("state/mtp-watch.pid");
+    if (auto pid = read_pid(pid_file); pid && process_alive(*pid)) return;
+    fs::path self = exe_path();
+    DWORD pid = start_process(quote_arg(self.string()) + " watch-mtp", root_dir(),
+                              path_in_root("logs/mtp-watch.out.log"), path_in_root("logs/mtp-watch.err.log"));
+    write_file(pid_file, std::to_string(pid) + "\n");
+    std::cout << "started MTP watcher pid " << pid << "\n";
+}
+
+static int cmd_mtp_tune(bool resume) {
+    WinsockInit wsa;
+    if (!qwen_mtp_draft()) throw std::runtime_error("verified Qwen MTP draft is required");
+
+    std::optional<fs::path> model;
+    for (const auto & candidate : gguf_files()) {
+        if (lower(candidate.filename().string()).find("lowgpu") != std::string::npos) {
+            model = candidate;
+            break;
+        }
+    }
+    if (!model) throw std::runtime_error("no LowGPU GGUF available for MTP tuning");
+
+    fs::path run_dir = path_in_root("logs/mtp-tuning");
+    fs::create_directories(run_dir);
+    fs::path result_file = run_dir / "results.jsonl";
+    const std::string natural_text_prompt =
+        "Schreibe einen zusammenhaengenden deutschen Sachtext ueber Baeume. "
+        "Schreibe fortlaufend weiter und beende den Text nicht vor dem Tokenlimit.";
+    std::vector<CompareProfile> profiles = {
+        {"mtp_n2", 8192, 512, true, "q4_0", 16, 16, false, true, 2, 0.0},
+        {"mtp_n3", 8192, 512, true, "q4_0", 16, 16, false, true, 3, 0.0},
+        {"mtp_n4", 8192, 512, true, "q4_0", 16, 16, false, true, 4, 0.0},
+        {"mtp_n4_p080", 8192, 512, true, "q4_0", 16, 16, false, true, 4, 0.8},
+    };
+
+    cmd_stop();
+    int failures = 0;
+    for (const auto & profile : profiles) {
+        failures += run_model_server_cases(*model, profile,
+                                           {{"natural_text_512", {natural_text_prompt, 512}}},
+                                           result_file, resume, 18080);
+    }
+    int restore = cmd_start(false, false, "fast");
+    std::cout << "MTP tuning results: " << result_file.string() << "\n";
+    return failures || restore ? 2 : 0;
+}
+
+static int cmd_tune(const std::string & fragment, bool resume) {
+    WinsockInit wsa;
+    fs::path run_dir = path_in_root("logs/performance-tuning");
+    fs::create_directories(run_dir);
+    fs::path result_file = run_dir / "results.jsonl";
+
+    // Direct benchmark instances require exclusive VRAM; restore the public APIs when done.
+    cmd_stop();
+
+    const std::string speed_prompt =
+        "Gib das Wort alpha genau 256-mal aus, nur durch einzelne Leerzeichen getrennt. Gib keine anderen Zeichen aus.";
+    std::vector<CompareProfile> profiles = {
+        {"auto_gpu_kv_q4_c8192_t8", 8192, 512, true, "q4_0", 8, 8},
+        {"auto_gpu_kv_q4_c8192_t16", 8192, 512, true, "q4_0", 16, 16},
+        {"auto_gpu_kv_q4_c8192_t32", 8192, 512, true, "q4_0", 32, 32},
+        {"auto_gpu_kv_q4_c32768_t16", 32768, 512, true, "q4_0", 16, 16},
+        {"auto_gpu_kv_q4_c65536_t16", 65536, 512, true, "q4_0", 16, 16},
+    };
+
+    int failures = 0;
+    int tested = 0;
+    for (const auto & model : gguf_files()) {
+        if (!model_matches(model, fragment)) continue;
+        ++tested;
+        for (const auto & profile : profiles) {
+            std::vector<std::pair<std::string, std::pair<std::string, int>>> cases = {
+                {"speed_256", {speed_prompt, 256}},
+            };
+            failures += run_model_server_cases(model, profile, cases, result_file, resume, 18080);
+        }
+    }
+    if (!tested) throw std::runtime_error("no model matches '" + fragment + "'");
+
+    int restore = cmd_start(false, false, "fast");
+    start_mtp_watcher_if_needed();
+    std::cout << "tuning results: " << result_file.string() << "\n";
+    return failures || restore ? 2 : 0;
+}
+
+static int cmd_context_probe(const std::string & fragment, bool resume) {
+    WinsockInit wsa;
+    fs::path run_dir = path_in_root("logs/context-probe");
+    fs::create_directories(run_dir);
+    fs::path result_file = run_dir / "results.jsonl";
+
+    std::string selected = fragment.empty() ? default_model() : fragment;
+    if (selected.empty()) throw std::runtime_error("contextprobe needs a default model or --model");
+
+    std::optional<fs::path> model;
+    for (const auto & candidate : gguf_files()) {
+        if (model_matches(candidate, selected)) {
+            model = candidate;
+            break;
+        }
+    }
+    if (!model) throw std::runtime_error("no model matches '" + selected + "'");
+
+    // Probe an active prompt, not only a preallocated KV cache, at practical short and long contexts.
+    cmd_stop();
+    int failures = 0;
+    for (int context : {8192, 32768}) {
+        CompareProfile profile{"active_context_q4_c" + std::to_string(context) + "_t16",
+                               context, 512, true, "q4_0", 16, 16};
+        std::vector<std::pair<std::string, std::pair<std::string, int>>> cases = {
+            {"active_context", {synthetic_context_prompt(context), 64}},
+        };
+        failures += run_model_server_cases(*model, profile, cases, result_file, resume, 18080);
+    }
+
+    int restore = cmd_start(false, false, "fast");
+    std::cout << "context probe results: " << result_file.string() << "\n";
+    return failures || restore ? 2 : 0;
 }
 
 static int cmd_longtest(const std::string & fragment, bool resume) {
@@ -1884,13 +2044,16 @@ static int cmd_downloads() {
 static void usage() {
     std::cout <<
         "lamacpp-local commands:\n"
-        "  run [--fast|--long] [--exit-after-tests]\n"
-        "  start [--fast|--long] [--no-proxy] [--no-preload]\n"
+        "  run [--fast|--balanced|--long] [--exit-after-tests]\n"
+        "  start [--fast|--balanced|--long] [--no-proxy] [--no-preload]\n"
         "  stop\n"
         "  status\n"
         "  switch <model-fragment> [--no-preload]\n"
         "  bench [prompt]\n"
         "  compare [--model <fragment>] [--resume]\n"
+        "  tune [--model <fragment>] [--resume]\n"
+        "  mtptune [--resume]\n"
+        "  contextprobe [--model <fragment>] [--resume]\n"
         "  longtest [--model <fragment>] [--resume]\n"
         "  watch-mtp\n"
         "  proxy\n"
@@ -1914,6 +2077,7 @@ int main(int argc, char ** argv) {
                 std::string a = lower(argv[i]);
                 if (a == "--exit-after-tests") exit_after_tests = true;
                 else if (a == "--fast") profile = "fast";
+                else if (a == "--balanced") profile = "balanced";
                 else if (a == "--long") profile = "long";
                 else throw std::runtime_error("unknown run option: " + std::string(argv[i]));
             }
@@ -1927,6 +2091,7 @@ int main(int argc, char ** argv) {
                 if (a == "--no-proxy") no_proxy = true;
                 else if (a == "--no-preload") no_preload = true;
                 else if (a == "--fast") profile = "fast";
+                else if (a == "--balanced") profile = "balanced";
                 else if (a == "--long") profile = "long";
                 else throw std::runtime_error("unknown start option: " + std::string(argv[i]));
             }
@@ -1950,7 +2115,7 @@ int main(int argc, char ** argv) {
             std::string prompt = argc >= 3 ? argv[2] : "Schreibe eine kurze technische Zusammenfassung von llama.cpp.";
             return cmd_bench(prompt);
         }
-        if (cmd == "compare" || cmd == "longtest") {
+        if (cmd == "compare" || cmd == "tune" || cmd == "contextprobe" || cmd == "longtest") {
             std::string fragment;
             bool resume = false;
             for (int i = 2; i < argc; ++i) {
@@ -1964,7 +2129,18 @@ int main(int argc, char ** argv) {
                     throw std::runtime_error("unknown " + cmd + " option: " + std::string(argv[i]));
                 }
             }
-            return cmd == "compare" ? cmd_compare(fragment, resume) : cmd_longtest(fragment, resume);
+            if (cmd == "compare") return cmd_compare(fragment, resume);
+            if (cmd == "tune") return cmd_tune(fragment, resume);
+            if (cmd == "contextprobe") return cmd_context_probe(fragment, resume);
+            return cmd_longtest(fragment, resume);
+        }
+        if (cmd == "mtptune") {
+            bool resume = false;
+            for (int i = 2; i < argc; ++i) {
+                if (lower(argv[i]) == "--resume") resume = true;
+                else throw std::runtime_error("unknown mtptune option: " + std::string(argv[i]));
+            }
+            return cmd_mtp_tune(resume);
         }
         if (cmd == "downloads") return cmd_downloads();
         usage();
