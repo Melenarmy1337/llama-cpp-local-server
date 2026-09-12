@@ -12,6 +12,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <cctype>
 #include <filesystem>
@@ -674,6 +675,30 @@ static std::optional<fs::path> qwen_mtp_draft() {
     return std::nullopt;
 }
 
+static bool supports_qwen38_mtp(const fs::path & model) {
+    return lower(model.filename().string()).find("qwen3.8-27b") != std::string::npos;
+}
+
+static std::optional<int> fast_mtp_draft_n(const fs::path & model) {
+    if (!supports_qwen38_mtp(model)) return std::nullopt;
+    const std::string name = lower(model.filename().string());
+    if (name.find("lowgpu") != std::string::npos) return 1;
+    if (name.find("ud-iq4_xs") != std::string::npos) return 1;
+    if (name.find("ud-q4_k_m") != std::string::npos) return 2;
+    if (name.find("qwen3.8-27b-iq4_xs") != std::string::npos) return 3;
+    return std::nullopt;
+}
+
+static std::optional<int> mtp_draft_n_for_profile(const fs::path & model, const Settings & settings, int context) {
+    if (settings.profile == "fast") return fast_mtp_draft_n(model);
+    if (settings.profile != "balanced" || context != 32768 || !supports_qwen38_mtp(model)) return std::nullopt;
+
+    const std::string name = lower(model.filename().string());
+    if (name.find("ud-q4_k_m") != std::string::npos) return 2;
+    if (name.find("qwen3.8-27b-iq4_xs") != std::string::npos) return 2;
+    return std::nullopt;
+}
+
 static std::vector<fs::path> gguf_files() {
     std::vector<fs::path> out;
     fs::path dir = path_in_root("models");
@@ -761,22 +786,20 @@ static void write_preset(int ctx, const Settings & s) {
     out << "batch-size = " << s.batch_size << "\n";
     out << "ubatch-size = " << s.ubatch_size << "\n";
 
-    if (s.profile == "fast") {
-        auto draft = qwen_mtp_draft();
-        if (draft) {
-            for (const auto & model : gguf_files()) {
-                if (lower(model.filename().string()).find("lowgpu") == std::string::npos) continue;
-                out << "\n[" << model.stem().string() << "]\n";
-                out << "model-draft = " << draft->string() << "\n";
-                out << "spec-type = draft-mtp\n";
-                out << "spec-draft-ngl = 999\n";
-                out << "spec-draft-device = " << preferred_device() << "\n";
-                out << "spec-draft-n-max = 2\n";
-                out << "spec-draft-type-k = q4_0\n";
-                out << "spec-draft-type-v = q4_0\n";
-                out << "spec-draft-threads = 2\n";
-                out << "spec-draft-threads-batch = 8\n";
-            }
+    if (auto draft = qwen_mtp_draft()) {
+        for (const auto & model : gguf_files()) {
+            auto draft_n = mtp_draft_n_for_profile(model, s, ctx);
+            if (!draft_n) continue;
+            out << "\n[" << model.stem().string() << "]\n";
+            out << "model-draft = " << draft->string() << "\n";
+            out << "spec-type = draft-mtp\n";
+            out << "spec-draft-ngl = 999\n";
+            out << "spec-draft-device = " << preferred_device() << "\n";
+            out << "spec-draft-n-max = " << *draft_n << "\n";
+            out << "spec-draft-type-k = q4_0\n";
+            out << "spec-draft-type-v = q4_0\n";
+            out << "spec-draft-threads = 2\n";
+            out << "spec-draft-threads-batch = 8\n";
         }
     }
     write_file(path_in_root("config/models.preset.ini"), out.str());
@@ -1598,7 +1621,7 @@ struct CompareProfile {
     int threads = 8;
     int threads_batch = 8;
     bool strict_gpu = false;
-    bool enable_mtp = true;
+    bool enable_mtp = false;
     int mtp_draft_n_max = 3;
     double mtp_draft_p_min = 0.0;
 };
@@ -1619,6 +1642,21 @@ struct CompareResult {
     std::string status;
     std::string response;
     std::string error;
+    int gpu_samples = 0;
+    double gpu_utilization_avg = 0.0;
+    double gpu_utilization_peak = 0.0;
+    double gpu_power_avg_w = 0.0;
+    double gpu_power_peak_w = 0.0;
+    double gpu_memory_peak_mib = 0.0;
+};
+
+struct GpuSample {
+    std::string timestamp;
+    double utilization_percent = 0.0;
+    double power_w = 0.0;
+    double graphics_clock_mhz = 0.0;
+    double memory_used_mib = 0.0;
+    double memory_total_mib = 0.0;
 };
 
 static int compare_fit_target(const fs::path & model) {
@@ -1687,7 +1725,7 @@ static std::string build_compare_server_command(const fs::path & model, int port
         cmd << " --fit on --fit-target " << profile.fit_target_mib;
         cmd << (profile.gpu_kv ? " --kv-offload" : " --no-kv-offload");
     }
-    if (profile.enable_mtp && lower(model.filename().string()).find("lowgpu") != std::string::npos) {
+    if (profile.enable_mtp && supports_qwen38_mtp(model)) {
         if (auto draft = qwen_mtp_draft()) {
             cmd << " --model-draft " << quote_arg(draft->string())
                 << " --spec-type draft-mtp --n-gpu-layers-draft 999"
@@ -1705,6 +1743,66 @@ static std::string build_compare_server_command(const fs::path & model, int port
     return cmd.str();
 }
 
+static std::optional<GpuSample> read_gpu_sample() {
+    const char * command = "nvidia-smi --query-gpu=utilization.gpu,power.draw,clocks.current.graphics,memory.used,memory.total --format=csv,noheader,nounits 2>NUL";
+    FILE * pipe = _popen(command, "r");
+    if (!pipe) return std::nullopt;
+
+    char line[512]{};
+    const bool read = std::fgets(line, sizeof(line), pipe) != nullptr;
+    _pclose(pipe);
+    if (!read) return std::nullopt;
+
+    std::vector<std::string> columns;
+    std::istringstream input(line);
+    for (std::string value; std::getline(input, value, ',');) columns.push_back(trim(value));
+    if (columns.size() < 5) return std::nullopt;
+
+    try {
+        GpuSample sample;
+        sample.timestamp = log_timestamp();
+        sample.utilization_percent = std::stod(columns[0]);
+        sample.power_w = std::stod(columns[1]);
+        sample.graphics_clock_mhz = std::stod(columns[2]);
+        sample.memory_used_mib = std::stod(columns[3]);
+        sample.memory_total_mib = std::stod(columns[4]);
+        return sample;
+    } catch (...) {
+        return std::nullopt;
+    }
+}
+
+static void summarize_gpu_samples(CompareResult & result, const std::vector<GpuSample> & samples) {
+    result.gpu_samples = static_cast<int>(samples.size());
+    if (samples.empty()) return;
+
+    for (const auto & sample : samples) {
+        result.gpu_utilization_avg += sample.utilization_percent;
+        result.gpu_power_avg_w += sample.power_w;
+        result.gpu_utilization_peak = std::max(result.gpu_utilization_peak, sample.utilization_percent);
+        result.gpu_power_peak_w = std::max(result.gpu_power_peak_w, sample.power_w);
+        result.gpu_memory_peak_mib = std::max(result.gpu_memory_peak_mib, sample.memory_used_mib);
+    }
+    result.gpu_utilization_avg /= samples.size();
+    result.gpu_power_avg_w /= samples.size();
+}
+
+static void append_gpu_samples(const fs::path & file, const CompareResult & result, const std::vector<GpuSample> & samples) {
+    if (samples.empty()) return;
+    std::lock_guard<std::mutex> lock(g_log_mutex);
+    const bool add_header = !fs::exists(file) || fs::file_size(file) == 0;
+    std::ofstream stream(file, std::ios::binary | std::ios::app);
+    if (!stream) throw std::runtime_error("cannot append " + file.string());
+    if (add_header) {
+        stream << "timestamp,case_id,model,profile,utilization_gpu_percent,power_w,graphics_clock_mhz,memory_used_mib,memory_total_mib\n";
+    }
+    for (const auto & sample : samples) {
+        stream << sample.timestamp << ',' << result.case_id << ',' << result.model << ',' << result.profile << ','
+               << sample.utilization_percent << ',' << sample.power_w << ',' << sample.graphics_clock_mhz << ','
+               << sample.memory_used_mib << ',' << sample.memory_total_mib << '\n';
+    }
+}
+
 static void append_compare_result(const fs::path & file, const CompareResult & result) {
     std::ostringstream out;
     out << "{\"timestamp\":\"" << utc_timestamp() << "\""
@@ -1719,6 +1817,12 @@ static void append_compare_result(const fs::path & file, const CompareResult & r
         << ",\"completion_tokens\":" << result.completion_tokens
         << ",\"completion_tokens_per_second\":" << result.completion_tokens_per_second
         << ",\"end_to_end_tokens_per_second\":" << result.end_to_end_tokens_per_second
+        << ",\"gpu_samples\":" << result.gpu_samples
+        << ",\"gpu_utilization_avg\":" << result.gpu_utilization_avg
+        << ",\"gpu_utilization_peak\":" << result.gpu_utilization_peak
+        << ",\"gpu_power_avg_w\":" << result.gpu_power_avg_w
+        << ",\"gpu_power_peak_w\":" << result.gpu_power_peak_w
+        << ",\"gpu_memory_peak_mib\":" << result.gpu_memory_peak_mib
         << ",\"output_words\":" << result.output_words
         << ",\"finish_reason\":\"" << json_escape(result.finish_reason) << "\""
         << ",\"response\":\"" << json_escape(result.response) << "\""
@@ -1791,7 +1895,7 @@ static bool model_matches(const fs::path & model, const std::string & fragment) 
 
 static int run_model_server_cases(const fs::path & model, const CompareProfile & profile,
                                   const std::vector<std::pair<std::string, std::pair<std::string, int>>> & cases,
-                                  const fs::path & result_file, bool resume, int port) {
+                                  const fs::path & result_file, bool resume, int port, bool capture_gpu = false) {
     std::string stem = model.stem().string();
     bool has_work = false;
     for (const auto & item : cases) {
@@ -1825,12 +1929,41 @@ static int run_model_server_cases(const fs::path & model, const CompareProfile &
     for (const auto & item : cases) {
         std::string case_id = stem + "/" + profile.name + "/" + item.first;
         if (resume && compare_case_finished(result_file, case_id)) continue;
+
+        std::atomic<bool> sampling{capture_gpu};
+        std::mutex samples_mutex;
+        std::vector<GpuSample> samples;
+        std::thread sampler;
+        if (capture_gpu) {
+            sampler = std::thread([&]() {
+                while (sampling.load()) {
+                    if (auto sample = read_gpu_sample()) {
+                        std::lock_guard<std::mutex> lock(samples_mutex);
+                        samples.push_back(*sample);
+                    }
+                    for (int i = 0; i < 5 && sampling.load(); ++i) {
+                        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                    }
+                }
+            });
+        }
         CompareResult result = run_compare_request(port, model, profile, case_id, item.second.first, item.second.second);
+        sampling = false;
+        if (sampler.joinable()) sampler.join();
+        if (capture_gpu) {
+            summarize_gpu_samples(result, samples);
+            append_gpu_samples(result_file.parent_path() / "gpu-samples.csv", result, samples);
+        }
         append_compare_result(result_file, result);
         std::cout << "  " << item.first << " status=" << result.status << " http=" << result.http_status
                   << " elapsed=" << result.elapsed_seconds << "s output=" << result.completion_tokens << " tok"
                   << " rate=" << result.completion_tokens_per_second << " tok/s"
-                  << " words=" << result.output_words << " finish=" << result.finish_reason << "\n";
+                  << " words=" << result.output_words << " finish=" << result.finish_reason;
+        if (capture_gpu) {
+            std::cout << " gpu_peak=" << result.gpu_utilization_peak << "%/" << result.gpu_power_peak_w
+                      << "W samples=" << result.gpu_samples;
+        }
+        std::cout << "\n";
         if (result.status != "ok") ++failures;
     }
     terminate_process(pid);
@@ -1913,6 +2046,145 @@ static int cmd_mtp_tune(bool resume) {
     return failures || restore ? 2 : 0;
 }
 
+static int cmd_mtp_matrix(bool resume) {
+    WinsockInit wsa;
+    if (!qwen_mtp_draft()) throw std::runtime_error("verified Qwen MTP draft is required");
+
+    fs::path run_dir = path_in_root("logs/mtp-matrix");
+    fs::create_directories(run_dir);
+    fs::path result_file = run_dir / "results.jsonl";
+    const std::string natural_text_prompt =
+        "Schreibe einen zusammenhaengenden deutschen Sachtext ueber Baeume. "
+        "Schreibe fortlaufend weiter und beende den Text nicht vor dem Tokenlimit.";
+
+    // At 8K, compare the useful draft lengths. At larger contexts, compare the
+    // natural-language winner from the first MTP tuning (two drafts) to baseline.
+    std::vector<CompareProfile> profiles = {
+        {"baseline_c8192", 8192, 512, true, "q4_0", 16, 16, false, false},
+        {"mtp_n1_c8192", 8192, 512, true, "q4_0", 16, 16, false, true, 1},
+        {"mtp_n2_c8192", 8192, 512, true, "q4_0", 16, 16, false, true, 2},
+        {"mtp_n3_c8192", 8192, 512, true, "q4_0", 16, 16, false, true, 3},
+        {"baseline_c32768", 32768, 512, true, "q4_0", 16, 16, false, false},
+        {"mtp_n2_c32768", 32768, 512, true, "q4_0", 16, 16, false, true, 2},
+        {"baseline_c65536", 65536, 512, true, "q4_0", 16, 16, false, false},
+        {"mtp_n2_c65536", 65536, 512, true, "q4_0", 16, 16, false, true, 2},
+    };
+
+    cmd_stop();
+    int failures = 0;
+    for (const auto & model : gguf_files()) {
+        for (const auto & profile : profiles) {
+            failures += run_model_server_cases(model, profile,
+                                               {{"natural_text_512", {natural_text_prompt, 512}}},
+                                               result_file, resume, 18080);
+        }
+    }
+    int restore = cmd_start(false, false, "fast");
+    std::cout << "MTP matrix results: " << result_file.string() << "\n";
+    return failures || restore ? 2 : 0;
+}
+
+static int cmd_mtp_verify(bool resume) {
+    WinsockInit wsa;
+    if (!qwen_mtp_draft()) throw std::runtime_error("verified Qwen MTP draft is required");
+
+    fs::path run_dir = path_in_root("logs/mtp-verification");
+    fs::create_directories(run_dir);
+    fs::path result_file = run_dir / "results.jsonl";
+    const std::string natural_text_prompt =
+        "Schreibe einen zusammenhaengenden deutschen Sachtext ueber Baeume. "
+        "Schreibe fortlaufend weiter und beende den Text nicht vor dem Tokenlimit.";
+
+    // The first matrix established valid baselines. This pass runs only the
+    // MTP cases that were not actually attached to the non-LowGPU models.
+    const std::vector<CompareProfile> standard_profiles = {
+        {"mtp_real_n1_c8192", 8192, 512, true, "q4_0", 16, 16, false, true, 1},
+        {"mtp_real_n2_c8192", 8192, 512, true, "q4_0", 16, 16, false, true, 2},
+        {"mtp_real_n3_c8192", 8192, 512, true, "q4_0", 16, 16, false, true, 3},
+        {"mtp_real_n2_c32768", 32768, 512, true, "q4_0", 16, 16, false, true, 2},
+        {"mtp_real_n2_c65536", 65536, 512, true, "q4_0", 16, 16, false, true, 2},
+    };
+    const std::vector<CompareProfile> lowgpu_profiles = {
+        {"mtp_real_n1_c32768", 32768, 512, true, "q4_0", 16, 16, false, true, 1},
+        {"mtp_real_n1_c65536", 65536, 512, true, "q4_0", 16, 16, false, true, 1},
+    };
+
+    cmd_stop();
+    int failures = 0;
+    for (const auto & model : gguf_files()) {
+        const bool is_lowgpu = lower(model.filename().string()).find("lowgpu") != std::string::npos;
+        const auto & profiles = is_lowgpu ? lowgpu_profiles : standard_profiles;
+        for (const auto & profile : profiles) {
+            failures += run_model_server_cases(model, profile,
+                                               {{"natural_text_512", {natural_text_prompt, 512}}},
+                                               result_file, resume, 18080);
+        }
+    }
+    int restore = cmd_start(false, false, "fast");
+    std::cout << "MTP verification results: " << result_file.string() << "\n";
+    return failures || restore ? 2 : 0;
+}
+
+static int cmd_gpu_load_matrix(bool resume) {
+    WinsockInit wsa;
+    fs::path run_dir = path_in_root("logs/gpu-load-matrix");
+    fs::create_directories(run_dir);
+    fs::path result_file = run_dir / "results.jsonl";
+
+    // This is a real active context prefill, not an empty allocated KV cache.
+    // It is deliberately kept at 8K so every installed Qwen GGUF can fit while
+    // still providing a sustained GPU-compute phase for power telemetry.
+    const CompareProfile profile{"active_prefill_c8192_t16", 8192, 512, true, "q4_0", 16, 16, false, false};
+    const std::vector<std::pair<std::string, std::pair<std::string, int>>> cases = {
+        {"active_prefill_4k", {synthetic_context_prompt(8192), 8}},
+    };
+
+    cmd_stop();
+    int failures = 0;
+    for (const auto & model : gguf_files()) {
+        failures += run_model_server_cases(model, profile, cases, result_file, resume, 18080, true);
+    }
+    int restore = cmd_start(false, false, "fast");
+    std::cout << "GPU load matrix results: " << result_file.string() << "\n";
+    return failures || restore ? 2 : 0;
+}
+
+static int cmd_mtp_context_verify(bool resume) {
+    WinsockInit wsa;
+    if (!qwen_mtp_draft()) throw std::runtime_error("verified Qwen MTP draft is required");
+
+    fs::path run_dir = path_in_root("logs/mtp-context-verification");
+    fs::create_directories(run_dir);
+    fs::path result_file = run_dir / "results.jsonl";
+    const std::string natural_text_prompt =
+        "Schreibe einen zusammenhaengenden deutschen Sachtext ueber Baeume. "
+        "Schreibe fortlaufend weiter und beende den Text nicht vor dem Tokenlimit.";
+
+    // For these two models the 8K winner differs from the n=2 candidate used
+    // for the first large-context pass. Test that winner directly before
+    // deciding whether balanced mode should attach an MTP draft.
+    cmd_stop();
+    int failures = 0;
+    for (const auto & model : gguf_files()) {
+        const std::string name = lower(model.filename().string());
+        int draft_n = 0;
+        if (name.find("qwen3.8-27b-iq4_xs") != std::string::npos) draft_n = 3;
+        if (name.find("ud-iq4_xs") != std::string::npos) draft_n = 1;
+        if (draft_n == 0) continue;
+
+        for (int context : {32768, 65536}) {
+            CompareProfile profile{"mtp_context_n" + std::to_string(draft_n), context, 512,
+                                   true, "q4_0", 16, 16, false, true, draft_n};
+            failures += run_model_server_cases(model, profile,
+                                               {{"natural_text_512", {natural_text_prompt, 512}}},
+                                               result_file, resume, 18080);
+        }
+    }
+    int restore = cmd_start(false, false, "fast");
+    std::cout << "MTP context verification results: " << result_file.string() << "\n";
+    return failures || restore ? 2 : 0;
+}
+
 static int cmd_tune(const std::string & fragment, bool resume) {
     WinsockInit wsa;
     fs::path run_dir = path_in_root("logs/performance-tuning");
@@ -1975,7 +2247,7 @@ static int cmd_context_probe(const std::string & fragment, bool resume) {
     int failures = 0;
     for (int context : {8192, 32768}) {
         CompareProfile profile{"active_context_q4_c" + std::to_string(context) + "_t16",
-                               context, 512, true, "q4_0", 16, 16};
+                               context, 512, true, "q4_0", 16, 16, false, true, 2};
         std::vector<std::pair<std::string, std::pair<std::string, int>>> cases = {
             {"active_context", {synthetic_context_prompt(context), 64}},
         };
@@ -2053,6 +2325,10 @@ static void usage() {
         "  compare [--model <fragment>] [--resume]\n"
         "  tune [--model <fragment>] [--resume]\n"
         "  mtptune [--resume]\n"
+        "  mtpmatrix [--resume]\n"
+        "  mtpverify [--resume]\n"
+        "  mtpcontext [--resume]\n"
+        "  gpuload [--resume]\n"
         "  contextprobe [--model <fragment>] [--resume]\n"
         "  longtest [--model <fragment>] [--resume]\n"
         "  watch-mtp\n"
@@ -2141,6 +2417,24 @@ int main(int argc, char ** argv) {
                 else throw std::runtime_error("unknown mtptune option: " + std::string(argv[i]));
             }
             return cmd_mtp_tune(resume);
+        }
+        if (cmd == "mtpmatrix") {
+            bool resume = false;
+            for (int i = 2; i < argc; ++i) {
+                if (lower(argv[i]) == "--resume") resume = true;
+                else throw std::runtime_error("unknown mtpmatrix option: " + std::string(argv[i]));
+            }
+            return cmd_mtp_matrix(resume);
+        }
+        if (cmd == "mtpverify" || cmd == "mtpcontext" || cmd == "gpuload") {
+            bool resume = false;
+            for (int i = 2; i < argc; ++i) {
+                if (lower(argv[i]) == "--resume") resume = true;
+                else throw std::runtime_error("unknown " + cmd + " option: " + std::string(argv[i]));
+            }
+            if (cmd == "mtpverify") return cmd_mtp_verify(resume);
+            if (cmd == "mtpcontext") return cmd_mtp_context_verify(resume);
+            return cmd_gpu_load_matrix(resume);
         }
         if (cmd == "downloads") return cmd_downloads();
         usage();

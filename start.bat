@@ -16,6 +16,10 @@ if /I "%CMD%"=="bench" goto direct
 if /I "%CMD%"=="compare" goto direct
 if /I "%CMD%"=="tune" goto direct
 if /I "%CMD%"=="mtptune" goto direct
+if /I "%CMD%"=="mtpmatrix" goto direct
+if /I "%CMD%"=="mtpverify" goto direct
+if /I "%CMD%"=="mtpcontext" goto direct
+if /I "%CMD%"=="gpuload" goto direct
 if /I "%CMD%"=="contextprobe" goto direct
 if /I "%CMD%"=="longtest" goto direct
 if /I "%CMD%"=="watch-mtp" goto direct

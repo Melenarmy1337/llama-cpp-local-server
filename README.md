@@ -90,6 +90,10 @@ start.bat compare         Compare all installed GGUF models and save responses/t
 start.bat tune            Test automatic GPU offload, thread counts, and 8K-64K contexts per GGUF
 start.bat tune --resume   Continue an interrupted tuning matrix without repeating completed cases
 start.bat mtptune         Tune MTP draft length and confidence for natural German text
+start.bat mtpmatrix       Compare MTP and baseline on every installed chat GGUF
+start.bat mtpverify       Run the corrected real-MTP verification pass for every installed chat GGUF
+start.bat mtpcontext      Compare the best short-context MTP settings again at 32K and 64K
+start.bat gpuload         Measure active-context prefill throughput plus RTX GPU utilization, VRAM, and wattage
 start.bat contextprobe    Test the active 8K and 32K input contexts for the default model
 start.bat longtest        Run 64K, 128K, and 262K synthetic context tests
 start.bat longtest --resume  Continue completed long-context work without repetition
@@ -228,6 +232,20 @@ rates, so a short verification answer does not hide prompt-processing speed.
 lengths and a confidence threshold against a fixed natural-language prompt.
 It records each trial in `logs/mtp-tuning/results.jsonl` and restores the fast
 API profile when it completes.
+
+`start.bat mtpmatrix` runs the compatibility and performance matrix across
+every installed chat GGUF. It tests baseline plus MTP draft lengths one through
+three at 8K, then baseline versus the best natural-language draft length at 32K
+and 64K. Results are written to `logs/mtp-matrix/results.jsonl`.
+
+`start.bat mtpverify` records the actual MTP-attached runs in
+`logs/mtp-verification/results.jsonl`. `start.bat gpuload` runs an active
+multi-thousand-token prefill for every model and records per-request summary
+metrics in `logs/gpu-load-matrix/results.jsonl` plus raw GPU samples in
+`logs/gpu-load-matrix/gpu-samples.csv`.
+
+`start.bat mtpcontext` retests the winning short-context MTP draft length at
+32K and 64K before a balanced-profile rule is enabled.
 
 ## Logging and privacy
 
